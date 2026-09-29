@@ -1,0 +1,43 @@
+# ---- Emscripten build outputs ----
+triangle.html
+triangle.js
+triangle.wasm
+triangle.data
+triangle.worker.js
+triangle.wasm.map
+
+# ---- Generic build artifacts ----
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+build/
+dist/
+
+# ---- Emscripten cache / temp ----
+.emscripten_cache/
+*.bc
+/tmp/emscripten_temp_*/
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Logs / reports ----
+*.log
+npm-debug.log*
+
+# ---- Local-only stuff ----
+# Uncomment if you want to keep the working car out of the repo
+# assets/car.glb
+
+# Python bytecode (for any tools/ scripts)
+__pycache__/
+*.pyc
