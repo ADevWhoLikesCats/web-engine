@@ -42,6 +42,18 @@ void probe_grid_bake(ProbeGrid* pg,
     pass_set_vec3(&pg->bake_pass, "uLightDir",    light_dir);
     pass_set_vec3(&pg->bake_pass, "uLightColor",  light_color);
     pass_set_f32 (&pg->bake_pass, "uLightIntensity", light_intensity);
+
+    extern GLuint g_hdr_tex_global;
+    extern int g_hdr_valid_global;
+    if (g_hdr_valid_global && g_hdr_tex_global) {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, g_hdr_tex_global);
+        pass_set_i32(&pg->bake_pass, "uHDRITex", 3);
+        pass_set_i32(&pg->bake_pass, "uHDRIValid", 1);
+        glActiveTexture(GL_TEXTURE0);
+    } else {
+        pass_set_i32(&pg->bake_pass, "uHDRIValid", 0);
+    }
     pass_set_i32 (&pg->bake_pass, "uProbeSGCount", PROBE_SG_COUNT);
 
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -77,6 +89,18 @@ void probe_grid_bake_with_tris(ProbeGrid* pg, TriGrid* tg,
     pass_set_vec3(&pg->bake_pass, "uLightDir",    light_dir);
     pass_set_vec3(&pg->bake_pass, "uLightColor",  light_color);
     pass_set_f32 (&pg->bake_pass, "uLightIntensity", light_intensity);
+
+    extern GLuint g_hdr_tex_global;
+    extern int g_hdr_valid_global;
+    if (g_hdr_valid_global && g_hdr_tex_global) {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, g_hdr_tex_global);
+        pass_set_i32(&pg->bake_pass, "uHDRITex", 3);
+        pass_set_i32(&pg->bake_pass, "uHDRIValid", 1);
+        glActiveTexture(GL_TEXTURE0);
+    } else {
+        pass_set_i32(&pg->bake_pass, "uHDRIValid", 0);
+    }
     pass_set_i32 (&pg->bake_pass, "uTriPerRow",   tg->tri_per_row);
     pass_set_f32 (&pg->bake_pass, "uIdxTexW",     (float)tg->idx_tex_w);
 
@@ -95,6 +119,7 @@ void probe_grid_bake_with_tris(ProbeGrid* pg, TriGrid* tg,
 
     glActiveTexture(GL_TEXTURE0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    glFinish();   /* force GPU sync so the timing is real */
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);

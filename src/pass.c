@@ -47,6 +47,22 @@ Pass pass_create(const char* vert_path, const char* frag_path) {
     glDeleteShader(vs);
     glDeleteShader(fs);
 
+    /* Verify the program is actually usable by binding it once */
+    glUseProgram(p.prog);
+    GLint linked = 0;
+    glGetProgramiv(p.prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        fprintf(stderr, "pass post-link check failed [%s + %s]\n", vert_path, frag_path);
+        abort();
+    }
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        fprintf(stderr, "pass created with GL error 0x%04X [%s + %s]\n",
+                err, vert_path, frag_path);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+    glUseProgram(0);
+
     glGenVertexArrays(1, &p.vao);
     return p;
 }

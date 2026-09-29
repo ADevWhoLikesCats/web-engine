@@ -28,6 +28,8 @@ uniform float uGroundY;
 uniform vec3  uGroundAlbedo;
 uniform vec3  uSkyHorizon;
 uniform vec3  uSkyZenith;
+uniform sampler2D uHDRITex;
+uniform int   uHDRIValid;
 uniform vec3  uLightDir;
 uniform vec3  uLightColor;
 uniform float uLightIntensity;
@@ -180,6 +182,13 @@ vec3 trace_scene(vec3 ro, vec3 rd) {
     }
     if (t_ground < 1e29) {
         return shade_hit(vec3(0.0, 1.0, 0.0), uGroundAlbedo);
+    }
+    if (uHDRIValid == 1) {
+        float phi = atan(rd.z, rd.x);
+        float theta = acos(clamp(rd.y, -1.0, 1.0));
+        vec2 uv = vec2(phi / (2.0 * 3.14159265) + 0.5,
+                       theta / 3.14159265);
+        return textureLod(uHDRITex, uv, 0.0).rgb;
     }
     float y = rd.y * 0.5 + 0.5;
     return mix(uSkyHorizon, uSkyZenith, y);

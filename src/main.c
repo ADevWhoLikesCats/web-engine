@@ -17,6 +17,7 @@
 #include "probe_grid.h"
 #include "tri_grid.h"
 #include "bloom.h"
+#include "hdr_env.h"
 
 #define CAR_PATH "/assets/car.glb"
 
@@ -36,6 +37,12 @@ static Framebuffer g_scene_fb;
 static Framebuffer g_sh_recon_fb;
 static Framebuffer g_ssr_fb;
 static Framebuffer g_taa_history[2];    /* ping-pong */
+static Framebuffer g_dof_fb;
+static Pass        g_dof_pass;
+static float       g_focus_distance = 4.0f;
+static float       g_focus_range = 6.0f;
+static float       g_max_blur_radius = 12.0f;
+static int         g_dof_enabled = 1;
 static int         g_taa_ping = 0;
 static Pass        g_taa_pass;
 static mat4        g_prev_viewproj;
@@ -43,6 +50,16 @@ static int         g_frame_index = 0;
 static int         g_taa_enabled = 1;
 static Pass        g_ssr_pass;
 static Pass        g_ssr_composite_pass;
+static HDREnv      g_hdr_env;
+#ifdef __cplusplus
+extern "C" {
+#endif
+GLuint g_hdr_tex_global = 0;
+int    g_hdr_valid_global = 0;
+#ifdef __cplusplus
+}
+#endif
+static Pass         g_sky_pass;
 static Bloom       g_bloom;
 static Pass        g_bloom_composite_pass;
 static Pass        g_bloom_debug_pass;
@@ -134,6 +151,29 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
         g_taa_enabled = !g_taa_enabled;
         printf("TAA -> %s\n", g_taa_enabled ? "on" : "off");
     }
+    if (e->key[0] == 'o' || e->key[0] == 'O') {
+        g_dof_enabled = !g_dof_enabled;
+        printf("DOF -> %s\n", g_dof_enabled ? "on" : "off");
+    }
+    if (e->key[0] == '-') {
+        g_focus_distance -= 0.5f;
+        if (g_focus_distance < 0.5f) g_focus_distance = 0.5f;
+        printf("focus distance -> %.2f\n", g_focus_distance);
+    }
+    if (e->key[0] == '=') {
+        g_focus_distance += 0.5f;
+        printf("focus distance -> %.2f\n", g_focus_distance);
+    }
+    if (e->key[0] == ';') {
+        g_max_blur_radius -= 1.0f;
+        if (g_max_blur_radius < 1.0f) g_max_blur_radius = 1.0f;
+        printf("blur radius -> %.1f\n", g_max_blur_radius);
+    }
+    if (e->key[0] == 0x27) {
+        g_max_blur_radius += 1.0f;
+        if (g_max_blur_radius > 40.0f) g_max_blur_radius = 40.0f;
+        printf("blur radius -> %.1f\n", g_max_blur_radius);
+    }
     if (e->key[0] == '[') {
         g_roughness_scale *= 0.5f;
         if (g_roughness_scale < 0.01f) g_roughness_scale = 0.01f;
@@ -174,6 +214,8 @@ static void sync_canvas_size(void) {
         if (g_taa_history[1].fbo) fb_destroy(&g_taa_history[1]);
         g_taa_history[0] = fb_create(css_w, css_h, FB_RGBA16F);
         g_taa_history[1] = fb_create(css_w, css_h, FB_RGBA16F);
+        if (g_dof_fb.fbo) fb_destroy(&g_dof_fb);
+        g_dof_fb = fb_create(css_w, css_h, FB_RGBA16F);
         if (g_bloom.mips[0].fbo) bloom_resize(&g_bloom, css_w, css_h);
     }
 }
@@ -236,6 +278,7 @@ static void init(void) {
     g_bloom_composite_pass = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_composite.frag");
     g_bloom_debug_pass = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_debug.frag");
     g_taa_pass = pass_create("/shaders/fullscreen.vert", "/shaders/taa_resolve.frag");
+    g_dof_pass = pass_create("/shaders/fullscreen.vert", "/shaders/dof.frag");
 
     printf("Loading %s...\n", CAR_PATH);
     g_car = model_load_glb(CAR_PATH);
@@ -261,6 +304,8 @@ static void init(void) {
     g_ground = ground_create(ground_y, 15.0f);
 
     g_shadow = shadow_create(2048);
+    g_hdr_env = hdr_env_load("/assets/sky.hdr");
+    g_sky_pass = pass_create("/shaders/fullscreen.vert", "/shaders/sky_background.frag");
 
     /* Compute scene bounds for the probe grid */
     g_probes = probe_grid_create(v3(-6.0f, -1.0f, -6.0f), v3(6.0f, 5.0f, 6.0f));
@@ -340,6 +385,11 @@ static void init(void) {
         vec3 light_color = v3(1.0f, 0.98f, 0.95f);
 
         double _t_bake = emscripten_get_now();
+        extern GLuint g_hdr_tex_global;
+        extern int g_hdr_valid_global;
+        g_hdr_tex_global = g_hdr_env.tex;
+        g_hdr_valid_global = g_hdr_env.valid;
+
         probe_grid_bake_with_tris(&g_probes, &g_tri_grid,
                                   g_car_grid_min, g_car_grid_max,
                                   ground_y, ground_albedo,
@@ -493,6 +543,14 @@ static void draw_car_into_fb(int w, int h, vec3 cam) {
     glEnable(GL_CULL_FACE);
 }
 
+static void check_gl_errors(const char* label) {
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        printf("[GL error after %s] 0x%04X\n", label, err);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+}
+
 static void frame(void) {
     sync_canvas_size();
 
@@ -511,7 +569,7 @@ static void frame(void) {
 
     /* SH + SG */
     sh_project(&g_sh, &g_capture.fb);
-    sg_fit(&g_sg, &g_capture.fb);
+    /*     sg_fit(&g_sg, &g_capture.fb); (disabled — replaced by tri_grid bake) */
 
     /* SH reconstruct for debug */
     fb_bind(&g_sh_recon_fb);
@@ -520,6 +578,64 @@ static void frame(void) {
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     sh_reconstruct(&g_sh, g_sh_recon_fb.width, g_sh_recon_fb.height, 1.0f);
+
+    /* Sky background pass */
+    if (g_hdr_env.valid && g_sky_pass.prog) {
+        fb_bind(&g_scene_fb);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+
+        pass_use(&g_sky_pass);
+    check_gl_errors("after pass_use");
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_hdr_env.tex);
+        pass_set_i32(&g_sky_pass, "uHDRI", 0);
+
+        vec3 sky_target = v3(0,0,0);
+        vec3 sky_up = v3(0,1,0);
+        mat4 sky_view = m4_look_at(cam, sky_target, sky_up);
+        mat4 sky_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                       (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                       0.1f, 200.0f);
+        mat4 sky_vp = m4_mul(sky_proj, sky_view);
+
+        float sky_inv_vp[16];
+        {
+            const float* m = sky_vp.m;
+            float inv[16];
+            inv[0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8] =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2] =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7] =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) sky_inv_vp[i] = inv[i] * invdet;
+        }
+
+        GLint loc = glGetUniformLocation(g_sky_pass.prog, "uInvViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, sky_inv_vp);
+
+        vec2 sky_inv_res = { 1.0f / (float)g_scene_fb.width, 1.0f / (float)g_scene_fb.height };
+        pass_set_vec2(&g_sky_pass, "uInvResolution", sky_inv_res);
+
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
+    check_gl_errors("sky pass");
 
     /* Shadow pass */
     {
@@ -543,6 +659,7 @@ static void frame(void) {
     glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     draw_car_into_fb(g_scene_fb.width, g_scene_fb.height, cam);
+    check_gl_errors("scene render");
 
     /* SSR pass: reads scene color + depth, writes SSR reflections */
     {
@@ -553,6 +670,7 @@ static void frame(void) {
         glClear(GL_COLOR_BUFFER_BIT);
 
         pass_use(&g_ssr_pass);
+    check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
@@ -623,6 +741,7 @@ static void frame(void) {
         glClear(GL_COLOR_BUFFER_BIT);
 
         pass_use(&g_ssr_composite_pass);
+    check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
@@ -696,6 +815,7 @@ static void frame(void) {
             glDisable(GL_CULL_FACE);
             glClear(GL_COLOR_BUFFER_BIT);
             pass_use(&g_blit_pass);
+    check_gl_errors("after pass_use");
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
             pass_set_tex(&g_blit_pass, "uScene", 0);
@@ -711,6 +831,7 @@ static void frame(void) {
         glClear(GL_COLOR_BUFFER_BIT);
 
         pass_use(&g_taa_pass);
+    check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
@@ -782,6 +903,78 @@ static void frame(void) {
     /* Pick the source HDR buffer */
     Framebuffer* final_hdr = g_taa_enabled ? &g_taa_history[1 - g_taa_ping] : &g_composite_fb;
 
+    /* DOF: read scene color + depth, write to g_dof_fb */
+    if (g_dof_enabled && g_dof_fb.fbo) {
+        fb_bind(&g_dof_fb);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_dof_pass);
+    check_gl_errors("after pass_use");
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, final_hdr->color);
+        pass_set_i32(&g_dof_pass, "uSceneColor", 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
+        pass_set_i32(&g_dof_pass, "uSceneDepth", 1);
+
+        /* Recompute view matrix (same as scene render) */
+        vec3 dof_target = v3(0,0,0);
+        vec3 dof_up = v3(0,1,0);
+        mat4 dof_view = m4_look_at(cam, dof_target, dof_up);
+        mat4 dof_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                       (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                       0.1f, 200.0f);
+        mat4 dof_vp = m4_mul(dof_proj, dof_view);
+
+        float dof_inv_vp[16];
+        {
+            const float* m = dof_vp.m;
+            float inv[16];
+            inv[0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8] =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2] =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7] =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) dof_inv_vp[i] = inv[i] * invdet;
+        }
+
+        GLint loc = glGetUniformLocation(g_dof_pass.prog, "uInvViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, dof_inv_vp);
+
+        pass_set_vec3(&g_dof_pass, "uCamPos", cam);
+        pass_set_f32 (&g_dof_pass, "uFocusDistance", g_focus_distance);
+        pass_set_f32 (&g_dof_pass, "uFocusRange", g_focus_range);
+        pass_set_f32 (&g_dof_pass, "uMaxBlurRadius", g_max_blur_radius);
+        vec2 dof_res = { (float)g_scene_fb.width, (float)g_scene_fb.height };
+        pass_set_vec2(&g_dof_pass, "uInvResolution", (vec2){1.0f/dof_res.x, 1.0f/dof_res.y});
+
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+
+        /* Redirect bloom and composite to read from DOF output */
+        final_hdr = &g_dof_fb;
+    }
+
     /* Bloom: bright pass + downsample + upsample chain */
     bloom_run(&g_bloom, final_hdr, 0.8f);
 
@@ -795,6 +988,7 @@ static void frame(void) {
         glClear(GL_COLOR_BUFFER_BIT);
 
         pass_use(&g_bloom_debug_pass);
+    check_gl_errors("after pass_use");
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_bloom.mips[0].color);
         pass_set_i32(&g_bloom_debug_pass, "uBloom", 0);
@@ -817,6 +1011,7 @@ static void frame(void) {
     glClear(GL_COLOR_BUFFER_BIT);
 
     pass_use(&g_bloom_composite_pass);
+    check_gl_errors("after pass_use");
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, final_hdr->color);
@@ -834,6 +1029,7 @@ static void frame(void) {
     /* Overlays */
     glViewport(8, 8, 200, 200);
     pass_use(&g_octa_debug_pass);
+    check_gl_errors("after pass_use");
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_capture.fb.color);
     pass_set_tex(&g_octa_debug_pass, "uOcta", 0);
@@ -844,6 +1040,7 @@ static void frame(void) {
 
     glViewport(8, g_screen_h - 200 - 8, 200, 200);
     pass_use(&g_octa_debug_pass);
+    check_gl_errors("after pass_use");
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_sh_recon_fb.color);
     pass_set_tex(&g_octa_debug_pass, "uOcta", 0);
@@ -863,6 +1060,7 @@ static void frame(void) {
         printf("GL error: 0x%04X\n", err);
         while (glGetError() != GL_NO_ERROR) {}
     }
+    check_gl_errors("end of frame");
 }
 
 int main(void) {
