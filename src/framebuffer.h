@@ -20,6 +20,7 @@ typedef struct {
 } Framebuffer;
 
 Framebuffer fb_create(int width, int height, FBFormat fmt);
+Framebuffer fb_create_with_depth_tex(int width, int height, FBFormat fmt);
 void        fb_destroy(Framebuffer* fb);
 void        fb_bind(Framebuffer* fb);
 void        fb_bind_read(Framebuffer* fb, int unit);

@@ -16,11 +16,13 @@
 #include "shadow.h"
 #include "probe_grid.h"
 #include "tri_grid.h"
+#include "bloom.h"
 
 #define CAR_PATH "/assets/car.glb"
 
 static GLuint prog;
 static GLint  u_model, u_viewproj, u_normalmat;
+static GLint  u_ssrcolor, u_ssrdepth, u_viewproj_mat, u_resolution;
 static GLint  u_campos, u_lightdir, u_lightcolor, u_lightintensity;
 static GLint  u_debugmode;
 static GLint  u_sh, u_sg, u_sgcount;
@@ -32,6 +34,19 @@ static GLint  u_probes, u_scenegridmin, u_scenegridmax;
 
 static Framebuffer g_scene_fb;
 static Framebuffer g_sh_recon_fb;
+static Framebuffer g_ssr_fb;
+static Framebuffer g_taa_history[2];    /* ping-pong */
+static int         g_taa_ping = 0;
+static Pass        g_taa_pass;
+static mat4        g_prev_viewproj;
+static int         g_frame_index = 0;
+static int         g_taa_enabled = 1;
+static Pass        g_ssr_pass;
+static Pass        g_ssr_composite_pass;
+static Bloom       g_bloom;
+static Pass        g_bloom_composite_pass;
+static Pass        g_bloom_debug_pass;
+static Framebuffer g_composite_fb;
 static Pass        g_blit_pass;
 static Pass        g_octa_debug_pass;
 static Capture     g_capture;
@@ -49,6 +64,26 @@ static mat4        g_car_model;
 static float g_roughness_scale = 1.0f;
 static int g_debug_mode = 0;
 static int g_screen_w = 0, g_screen_h = 0;
+
+/* Halton low-discrepancy sequence for TAA jitter */
+static float halton_seq(int index, int base) {
+    float f = 1.0f;
+    float r = 0.0f;
+    int i = index;
+    while (i > 0) {
+        f /= (float)base;
+        r += f * (float)(i % base);
+        i /= base;
+    }
+    return r;
+}
+
+/* 8-sample Halton(2,3) sequence, offset by 0.5 for [-0.5, 0.5] range */
+static void taa_jitter_offset(int frame, float* out_x, float* out_y) {
+    int idx = (frame % 8) + 1;
+    *out_x = halton_seq(idx, 2) - 0.5f;
+    *out_y = halton_seq(idx, 3) - 0.5f;
+}
 
 static GLuint compile(GLenum type, const char* src, const char* path) {
     GLuint s = glCreateShader(type);
@@ -92,8 +127,12 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
     (void)user;
     if (event_type != EMSCRIPTEN_EVENT_KEYDOWN) return EM_FALSE;
     if (e->key[0] == 'm' || e->key[0] == 'M') {
-        g_debug_mode = (g_debug_mode + 1) % 12;
+        g_debug_mode = (g_debug_mode + 1) % 14;
         printf("debug mode -> %d\n", g_debug_mode);
+    }
+    if (e->key[0] == 't' || e->key[0] == 'T') {
+        g_taa_enabled = !g_taa_enabled;
+        printf("TAA -> %s\n", g_taa_enabled ? "on" : "off");
     }
     if (e->key[0] == '[') {
         g_roughness_scale *= 0.5f;
@@ -110,7 +149,7 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
 
 static void create_scene_fb(int w, int h) {
     if (g_scene_fb.fbo) fb_destroy(&g_scene_fb);
-    g_scene_fb = fb_create(w, h, FB_RGBA16F);
+    g_scene_fb = fb_create_with_depth_tex(w, h, FB_RGBA16F);
 }
 
 static void sync_canvas_size(void) {
@@ -127,6 +166,15 @@ static void sync_canvas_size(void) {
         g_screen_w = css_w;
         g_screen_h = css_h;
         create_scene_fb(css_w, css_h);
+        if (g_ssr_fb.fbo) fb_destroy(&g_ssr_fb);
+        g_ssr_fb = fb_create(css_w, css_h, FB_RGBA16F);
+        if (g_composite_fb.fbo) fb_destroy(&g_composite_fb);
+        g_composite_fb = fb_create(css_w, css_h, FB_RGBA16F);
+        if (g_taa_history[0].fbo) fb_destroy(&g_taa_history[0]);
+        if (g_taa_history[1].fbo) fb_destroy(&g_taa_history[1]);
+        g_taa_history[0] = fb_create(css_w, css_h, FB_RGBA16F);
+        g_taa_history[1] = fb_create(css_w, css_h, FB_RGBA16F);
+        if (g_bloom.mips[0].fbo) bloom_resize(&g_bloom, css_w, css_h);
     }
 }
 
@@ -166,6 +214,10 @@ static void init(void) {
     u_probes           = glGetUniformLocation(prog, "uProbeSGs");
     u_scenegridmin     = glGetUniformLocation(prog, "uSceneGridMin");
     u_scenegridmax     = glGetUniformLocation(prog, "uSceneGridMax");
+    u_ssrcolor         = glGetUniformLocation(prog, "uSSRColor");
+    u_ssrdepth         = glGetUniformLocation(prog, "uSSRDepth");
+    u_viewproj_mat     = glGetUniformLocation(prog, "uViewProj");
+    u_resolution       = glGetUniformLocation(prog, "uResolution");
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
@@ -179,6 +231,11 @@ static void init(void) {
     g_sh              = sh_create();
     g_sg              = sg_create();
     g_sh_recon_fb     = fb_create(200, 200, FB_RGBA16F);
+    g_ssr_pass        = pass_create("/shaders/fullscreen.vert", "/shaders/ssr.frag");
+    g_ssr_composite_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssr_composite.frag");
+    g_bloom_composite_pass = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_composite.frag");
+    g_bloom_debug_pass = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_debug.frag");
+    g_taa_pass = pass_create("/shaders/fullscreen.vert", "/shaders/taa_resolve.frag");
 
     printf("Loading %s...\n", CAR_PATH);
     g_car = model_load_glb(CAR_PATH);
@@ -303,6 +360,12 @@ static void draw_car_into_fb(int w, int h, vec3 cam) {
     mat4 view = m4_look_at(cam, target, up);
     mat4 proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
                                (float)w / (float)h, 0.1f, 200.0f);
+    if (g_taa_enabled) {
+        float jx, jy;
+        taa_jitter_offset(g_frame_index, &jx, &jy);
+        proj.m[8] += jx * 2.0f / (float)w;
+        proj.m[9] += jy * 2.0f / (float)h;
+    }
     mat4 viewproj = m4_mul(proj, view);
 
     glUseProgram(prog);
@@ -323,6 +386,18 @@ static void draw_car_into_fb(int w, int h, vec3 cam) {
     glBindTexture(GL_TEXTURE_2D, g_probes.fb.color);
     glActiveTexture(GL_TEXTURE0);
     glUniform1i(u_probes, 9);
+    glActiveTexture(GL_TEXTURE10);
+    glBindTexture(GL_TEXTURE_2D, g_ssr_fb.color);
+    glActiveTexture(GL_TEXTURE11);
+    glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(u_ssrcolor, 10);
+    glUniform1i(u_ssrdepth, 11);
+    {
+        vec2 res = { (float)g_scene_fb.width, (float)g_scene_fb.height };
+        glUniform2f(u_resolution, res.x, res.y);
+        glUniformMatrix4fv(u_viewproj_mat, 1, GL_FALSE, viewproj.m);
+    }
 
     vec3 light_dir = v3_norm(v3(-0.4f, -1.0f, -0.5f));
     glUniform3f(u_lightdir, light_dir.x, light_dir.y, light_dir.z);
@@ -469,7 +544,271 @@ static void frame(void) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     draw_car_into_fb(g_scene_fb.width, g_scene_fb.height, cam);
 
-    /* Blit to canvas */
+    /* SSR pass: reads scene color + depth, writes SSR reflections */
+    {
+        fb_bind(&g_ssr_fb);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_ssr_pass);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
+        pass_set_i32(&g_ssr_pass, "uSceneColor", 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
+        pass_set_i32(&g_ssr_pass, "uSceneDepth", 1);
+
+        /* Compute viewProj locally (same as in draw_car_into_fb) */
+        vec3 ssr_target = v3(0,0,0);
+        vec3 ssr_up = v3(0,1,0);
+        mat4 ssr_view = m4_look_at(cam, ssr_target, ssr_up);
+        mat4 ssr_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                       (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                       0.1f, 200.0f);
+        mat4 ssr_viewproj = m4_mul(ssr_proj, ssr_view);
+
+        /* Compute inverse view-projection */
+        float inv_vp[16];
+        {
+            /* Inline 4x4 inverse */
+            const float* m = ssr_viewproj.m;
+            float inv[16];
+            inv[0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8] =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2] =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7] =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) inv_vp[i] = inv[i] * invdet;
+        }
+        pass_set_mat4(&g_ssr_pass, "uInvViewProj", (mat4){0});  /* will set below */
+        GLint loc = glGetUniformLocation(g_ssr_pass.prog, "uInvViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, inv_vp);
+
+        loc = glGetUniformLocation(g_ssr_pass.prog, "uViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, ssr_viewproj.m);
+
+        pass_set_vec3(&g_ssr_pass, "uCamPos", cam);
+        vec2 res = { (float)g_scene_fb.width, (float)g_scene_fb.height };
+        pass_set_vec2(&g_ssr_pass, "uResolution", res);
+
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
+
+    /* Composite pass: scene + SSR -> final HDR */
+    {
+        fb_bind(&g_composite_fb);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_ssr_composite_pass);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
+        pass_set_i32(&g_ssr_composite_pass, "uSceneColor", 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_ssr_fb.color);
+        pass_set_i32(&g_ssr_composite_pass, "uSSRColor", 1);
+
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
+        pass_set_i32(&g_ssr_composite_pass, "uSceneDepth", 2);
+
+        /* Recompute ssr_viewproj (same as in SSR block) */
+        vec3 ssr_target = v3(0,0,0);
+        vec3 ssr_up = v3(0,1,0);
+        mat4 ssr_view = m4_look_at(cam, ssr_target, ssr_up);
+        mat4 ssr_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                       (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                       0.1f, 200.0f);
+        mat4 ssr_vp = m4_mul(ssr_proj, ssr_view);
+
+        /* Compute inverse for depth reconstruction */
+        float inv_vp[16];
+        {
+            const float* m = ssr_vp.m;
+            float inv[16];
+            inv[0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8] =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2] =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7] =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) inv_vp[i] = inv[i] * invdet;
+        }
+
+        GLint loc = glGetUniformLocation(g_ssr_composite_pass.prog, "uInvViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, inv_vp);
+
+        pass_set_vec3(&g_ssr_composite_pass, "uCamPos", cam);
+        vec2 res = { (float)g_scene_fb.width, (float)g_scene_fb.height };
+        pass_set_vec2(&g_ssr_composite_pass, "uResolution", res);
+
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
+
+    /* TAA resolve: composite -> TAA history */
+    if (g_taa_enabled) {
+        int curr = g_taa_ping;
+        int prev = 1 - g_taa_ping;
+
+        /* First frame: initialize history with current frame */
+        if (g_frame_index == 0) {
+            fb_bind(&g_taa_history[prev]);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&g_blit_pass);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
+            pass_set_tex(&g_blit_pass, "uScene", 0);
+            vec2 inv0 = { 1.0f / (float)g_composite_fb.width, 1.0f / (float)g_composite_fb.height };
+            pass_set_vec2(&g_blit_pass, "uInvSize", inv0);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+
+        fb_bind(&g_taa_history[curr]);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_taa_pass);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
+        pass_set_i32(&g_taa_pass, "uCurrentColor", 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_taa_history[prev].color);
+        pass_set_i32(&g_taa_pass, "uHistoryColor", 1);
+
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
+        pass_set_i32(&g_taa_pass, "uCurrentDepth", 2);
+
+        /* Current viewProj and its inverse — same formulas as before */
+        vec3 taa_target = v3(0,0,0);
+        vec3 taa_up = v3(0,1,0);
+        mat4 taa_view = m4_look_at(cam, taa_target, taa_up);
+        mat4 taa_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                       (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                       0.1f, 200.0f);
+        mat4 taa_vp = m4_mul(taa_proj, taa_view);
+
+        float taa_inv_vp[16];
+        {
+            const float* m = taa_vp.m;
+            float inv[16];
+            inv[0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8] =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2] =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7] =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) taa_inv_vp[i] = inv[i] * invdet;
+        }
+
+        GLint loc = glGetUniformLocation(g_taa_pass.prog, "uInvViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, taa_inv_vp);
+        loc = glGetUniformLocation(g_taa_pass.prog, "uPrevViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, g_prev_viewproj.m);
+
+        pass_set_vec3(&g_taa_pass, "uCamPos", cam);
+        vec2 res = { (float)g_composite_fb.width, (float)g_composite_fb.height };
+        pass_set_vec2(&g_taa_pass, "uResolution", res);
+        pass_set_f32(&g_taa_pass, "uBlendFactor", 0.9f);
+
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+
+        g_taa_ping = prev;   /* swap for next frame */
+
+        /* Save this frame's viewProj for next frame's motion vectors */
+        g_prev_viewproj = taa_vp;
+    }
+
+    /* Pick the source HDR buffer */
+    Framebuffer* final_hdr = g_taa_enabled ? &g_taa_history[1 - g_taa_ping] : &g_composite_fb;
+
+    /* Bloom: bright pass + downsample + upsample chain */
+    bloom_run(&g_bloom, final_hdr, 0.8f);
+
+    /* Bloom debug: if M cycled to mode 13, blit the bloom mip directly */
+    if (g_debug_mode == 13) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, g_screen_w, g_screen_h);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_bloom_debug_pass);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_bloom.mips[0].color);
+        pass_set_i32(&g_bloom_debug_pass, "uBloom", 0);
+        vec2 inv_dbg = { 1.0f / (float)g_bloom.mips[0].width, 1.0f / (float)g_bloom.mips[0].height };
+        pass_set_vec2(&g_bloom_debug_pass, "uInvSize", inv_dbg);
+        pass_set_f32 (&g_bloom_debug_pass, "uGain", 5.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        return;
+    }
+
+    /* Final composite: HDR + bloom, tonemapped to canvas */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, g_screen_w, g_screen_h);
     glDisable(GL_DEPTH_TEST);
@@ -477,12 +816,19 @@ static void frame(void) {
     glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    pass_use(&g_blit_pass);
+    pass_use(&g_bloom_composite_pass);
+
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
-    pass_set_tex(&g_blit_pass, "uScene", 0);
-    vec2 inv = { 1.0f / (float)g_scene_fb.width, 1.0f / (float)g_scene_fb.height };
-    pass_set_vec2(&g_blit_pass, "uInvSize", inv);
+    glBindTexture(GL_TEXTURE_2D, final_hdr->color);
+    pass_set_i32(&g_bloom_composite_pass, "uScene", 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_bloom.mips[0].color);
+    pass_set_i32(&g_bloom_composite_pass, "uBloom", 1);
+
+    pass_set_f32(&g_bloom_composite_pass, "uBloomStrength", 0.15f);
+    vec2 inv = { 1.0f / (float)final_hdr->width, 1.0f / (float)final_hdr->height };
+    pass_set_vec2(&g_bloom_composite_pass, "uInvSize", inv);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     /* Overlays */
@@ -509,6 +855,8 @@ static void frame(void) {
     glViewport(0, 0, g_screen_w, g_screen_h);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
+
+    g_frame_index++;
 
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {

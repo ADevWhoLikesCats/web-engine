@@ -91,3 +91,49 @@ void fb_unbind(int screen_w, int screen_h) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, screen_w, screen_h);
 }
+
+
+Framebuffer fb_create_with_depth_tex(int width, int height, FBFormat fmt) {
+    check_float_support();
+    Framebuffer fb = {0};
+    fb.width = width;
+    fb.height = height;
+    fb.format = fmt;
+
+    GLenum internal, type, format;
+    format = to_gl_format(fmt, &internal, &type);
+
+    glGenTextures(1, &fb.color);
+    glBindTexture(GL_TEXTURE_2D, fb.color);
+    glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0, format, type, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    /* Depth texture instead of renderbuffer */
+    glGenTextures(1, &fb.depth);
+    glBindTexture(GL_TEXTURE_2D, fb.depth);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, height, 0,
+                 GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenFramebuffers(1, &fb.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.color, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, fb.depth, 0);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "[fb] incomplete framebuffer (0x%04X) %dx%d fmt=%d\n",
+                status, width, height, (int)fmt);
+        abort();
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return fb;
+}

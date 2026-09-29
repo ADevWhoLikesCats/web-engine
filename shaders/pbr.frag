@@ -22,6 +22,10 @@ uniform sampler2D uSH;
 uniform sampler2D uProbeSGs;
 uniform vec3      uSceneGridMin;
 uniform vec3      uSceneGridMax;
+uniform sampler2D uSSRColor;
+uniform sampler2D uSSRDepth;
+uniform mat4      uViewProj;
+uniform vec2      uResolution;
 
 /* Material textures */
 uniform sampler2D uTexBasecolor;
@@ -141,6 +145,13 @@ vec3 evalSpecular(vec3 F0, float rough, float NdotV, float NdotL, float NdotH, f
     return (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
 }
 
+vec3 ssr_sample(vec2 uv) {
+    /* Simple: read the SSR color and hit flag from the previous pass.
+       The SSR pass writes hit_color to .rgb and hit_found to .a. */
+    vec4 ssr = texture(uSSRColor, uv);
+    return ssr.rgb * ssr.a;
+}
+
 void main() {
     /* --- Material sample --- */
     vec3 albedo = uBasecolorFactor;
@@ -201,6 +212,11 @@ void main() {
         return;
     }
 
+    if (uDebugMode == 12) {
+        vec2 suv = gl_FragCoord.xy / uResolution;
+        fragColor = texture(uSSRColor, suv);
+        return;
+    }
     if (uDebugMode == 11) {
         vec3 span = max(uSceneGridMax - uSceneGridMin, vec3(1e-4));
         vec3 t = clamp((vWorldPos - uSceneGridMin) / span, 0.0, 1.0);
@@ -224,8 +240,9 @@ void main() {
     vec3 E_ambient = sh_irradiance(N);
     vec3 indirect_diffuse = kD * albedo / PI * E_ambient;
 
-    /* --- Indirect specular (SG probe grid) --- */
+        /* --- Indirect specular: SG only (SSR composited post) --- */
     vec3 sg_refl = sg_specular(vWorldPos, R, roughness);
+
     vec3 F_indirect = F_Schlick(F0, NdotV);
     float roughAtten = 1.0 - roughness * 0.6;
     vec3 indirect_specular = sg_refl * F_indirect * roughAtten;
