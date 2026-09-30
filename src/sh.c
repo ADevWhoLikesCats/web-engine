@@ -8,7 +8,7 @@ SH sh_create(void) {
     SH sh = {0};
     /* 9x1 RGBA32F */
     sh.fb = fb_create(9, 1, FB_RGBA32F);
-    sh.project     = pass_create("/shaders/fullscreen.vert", "/shaders/sh_project.frag");
+    sh.project = pass_create("/shaders/fullscreen.vert", "/shaders/sh_project.frag");
     sh.reconstruct = pass_create("/shaders/fullscreen.vert", "/shaders/sh_reconstruct.frag");
     return sh;
 }

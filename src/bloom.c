@@ -3,9 +3,9 @@
 
 Bloom bloom_create(int width, int height) {
     Bloom b = {0};
-    b.bright     = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_bright.frag");
+    b.bright = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_bright.frag");
     b.downsample = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_downsample.frag");
-    b.upsample   = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_upsample.frag");
+    b.upsample = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_upsample.frag");
     bloom_resize(&b, width, height);
     return b;
 }
@@ -47,6 +47,7 @@ void bloom_run(Bloom* b, Framebuffer* scene_hdr, float threshold) {
     pass_set_f32(&b->bright, "uThreshold", threshold);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
+
     /* 2. Downsample chain: mip 0 -> mip 1 -> ... -> mip N-1 */
     pass_use(&b->downsample);
     for (int i = 1; i < BLOOM_MIPS; ++i) {
@@ -70,14 +71,19 @@ void bloom_run(Bloom* b, Framebuffer* scene_hdr, float threshold) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, b->mips[i].color);
         pass_set_i32(&b->upsample, "uSource", 0);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, b->mips[i-1].color);
-        pass_set_i32(&b->upsample, "uTarget", 1);
         vec2 t = { 1.0f / (float)b->mips[i-1].width, 1.0f / (float)b->mips[i-1].height };
         pass_set_vec2(&b->upsample, "uTexel", t);
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
     glDisable(GL_BLEND);
+
+    /* Unbind texture units that were sampling bloom mips — otherwise the
+       next pass that writes to a mip while reading it causes feedback. */
+    for (int _u = 0; _u < 8; ++_u) {
+        glActiveTexture(GL_TEXTURE0 + _u);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    glActiveTexture(GL_TEXTURE0);
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);

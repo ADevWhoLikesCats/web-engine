@@ -116,6 +116,7 @@ Pass pass_create(const char* vert_path, const char* frag_path) {
     }
 
     clear_gl_errors();
+    fprintf(stderr, "[inside pass_create] p.prog=%u p.vao=%u\n", p.prog, p.vao);
     return p;
 }
 

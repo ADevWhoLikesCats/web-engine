@@ -1,16 +1,16 @@
 #version 300 es
 precision highp float;
 
-uniform sampler2D uSource;    /* smaller (blurred) */
-uniform sampler2D uTarget;    /* larger (base to add to) */
-uniform vec2 uTexel;          /* 1 / target_size */
+uniform sampler2D uSource;   /* smaller (blurred) — the level below */
+uniform vec2 uTexel;         /* 1 / target_size */
 
 out vec4 fragColor;
 
 void main() {
     vec2 uv = gl_FragCoord.xy * uTexel;
     vec3 small = texture(uSource, uv).rgb;
-    vec3 big   = texture(uTarget, uv).rgb;
-    /* Additive blend with the smaller-level's wider blur */
-    fragColor = vec4(big + small, 1.0);
+    /* Additive blend with the framebuffer's current content:
+       the value from the level below is added to the accumulated
+       result already stored in the target mip. */
+    fragColor = vec4(small, 1.0);
 }

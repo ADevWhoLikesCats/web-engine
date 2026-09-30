@@ -267,18 +267,30 @@ static void init(void) {
     glCullFace(GL_BACK);
     glFrontFace(GL_CCW);
 
-    g_blit_pass       = pass_create("/shaders/fullscreen.vert", "/shaders/blit_tonemap.frag");
+    g_blit_pass = pass_create("/shaders/fullscreen.vert", "/shaders/blit_tonemap.frag");
+
+
+    printf("[create] g_blit_pass=%u\n", g_blit_pass.prog);
     g_octa_debug_pass = pass_create("/shaders/fullscreen.vert", "/shaders/octa_debug.frag");
+    printf("[create] g_octa_debug_pass=%u\n", g_octa_debug_pass.prog);
     g_capture         = capture_create(128);
+    g_bloom           = bloom_create(640, 480);
     g_sh              = sh_create();
     g_sg              = sg_create();
     g_sh_recon_fb     = fb_create(200, 200, FB_RGBA16F);
-    g_ssr_pass        = pass_create("/shaders/fullscreen.vert", "/shaders/ssr.frag");
+    g_ssr_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssr.frag");
+
+    printf("[create] g_ssr_pass=%u\n", g_ssr_pass.prog);
     g_ssr_composite_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssr_composite.frag");
+    printf("[create] g_ssr_composite_pass=%u\n", g_ssr_composite_pass.prog);
     g_bloom_composite_pass = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_composite.frag");
+    printf("[create] g_bloom_composite_pass=%u\n", g_bloom_composite_pass.prog);
     g_bloom_debug_pass = pass_create("/shaders/fullscreen.vert", "/shaders/bloom_debug.frag");
+    printf("[create] g_bloom_debug_pass=%u\n", g_bloom_debug_pass.prog);
     g_taa_pass = pass_create("/shaders/fullscreen.vert", "/shaders/taa_resolve.frag");
+    printf("[create] g_taa_pass=%u\n", g_taa_pass.prog);
     g_dof_pass = pass_create("/shaders/fullscreen.vert", "/shaders/dof.frag");
+    printf("[create] g_dof_pass=%u\n", g_dof_pass.prog);
 
     printf("Loading %s...\n", CAR_PATH);
     g_car = model_load_glb(CAR_PATH);
@@ -302,10 +314,19 @@ static void init(void) {
     /* Ground plane at the car's bottom Y */
     float ground_y = g_car.min_bb.y * scale - c.y * scale - 0.02f;
     g_ground = ground_create(ground_y, 15.0f);
+    printf("=== before sky pass creation ===\n");
+    for (int _k = 0; _k < 3; ++_k) {
+        GLuint _test = glCreateProgram();
+        printf("  test program id = %u\n", _test);
+        glDeleteProgram(_test);
+    }
 
+
+    g_sky_pass = pass_create("/shaders/fullscreen.vert", "/shaders/sky_background.frag");
     g_shadow = shadow_create(2048);
     g_hdr_env = hdr_env_load("/assets/sky.hdr");
-    g_sky_pass = pass_create("/shaders/fullscreen.vert", "/shaders/sky_background.frag");
+
+    printf("[create] g_sky_pass=%u\n", g_sky_pass.prog);
 
     /* Compute scene bounds for the probe grid */
     g_probes = probe_grid_create(v3(-6.0f, -1.0f, -6.0f), v3(6.0f, 5.0f, 6.0f));
@@ -585,7 +606,14 @@ static void frame(void) {
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
 
-        pass_use(&g_sky_pass);
+        /* Unbind all textures to prevent feedback warnings */
+    for (int _u = 0; _u < 16; ++_u) {
+        glActiveTexture(GL_TEXTURE0 + _u);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    glActiveTexture(GL_TEXTURE0);
+
+    pass_use(&g_sky_pass);
     check_gl_errors("after pass_use");
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_hdr_env.tex);
@@ -978,6 +1006,10 @@ static void frame(void) {
     /* Bloom: bright pass + downsample + upsample chain */
     bloom_run(&g_bloom, final_hdr, 0.8f);
 
+    /* Ensure we're not still bound to a bloom mip when the composite samples it */
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g_screen_w, g_screen_h);
+
     /* Bloom debug: if M cycled to mode 13, blit the bloom mip directly */
     if (g_debug_mode == 13) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1081,19 +1113,22 @@ int main(void) {
     printf("GL_RENDERER = %s\n", glGetString(GL_RENDERER));
 
     init();
-    printf("=== program map ===\n");
-    printf("blit=%u octa=%u sky=%u\n",
-           g_blit_pass.prog, g_octa_debug_pass.prog, g_sky_pass.prog);
-    printf("ssr=%u ssr_comp=%u bloom_comp=%u bloom_dbg=%u\n",
-           g_ssr_pass.prog, g_ssr_composite_pass.prog,
-           g_bloom_composite_pass.prog, g_bloom_debug_pass.prog);
-    printf("taa=%u dof=%u\n", g_taa_pass.prog, g_dof_pass.prog);
-    printf("bloom: b=%u d=%u u=%u\n",
-           g_bloom.bright.prog, g_bloom.downsample.prog, g_bloom.upsample.prog);
-    printf("capture=%u probes_bake=%u\n",
-           g_capture.pass.prog, g_probes.bake_pass.prog);
-    printf("sh_proj=%u sh_recon=%u sg=%u\n",
-           g_sh.project.prog, g_sh.reconstruct.prog, g_sg.fit.prog);
+    char _msg[1024];
+    snprintf(_msg, sizeof(_msg),
+        "blit=%u octa=%u sky=%u\n"
+        "ssr=%u ssr_comp=%u bloom_comp=%u bloom_dbg=%u\n"
+        "taa=%u dof=%u\n"
+        "bloom: b=%u d=%u u=%u\n"
+        "capture=%u probes_bake=%u\n"
+        "sh_proj=%u sh_recon=%u sg=%u",
+        g_blit_pass.prog, g_octa_debug_pass.prog, g_sky_pass.prog,
+        g_ssr_pass.prog, g_ssr_composite_pass.prog,
+        g_bloom_composite_pass.prog, g_bloom_debug_pass.prog,
+        g_taa_pass.prog, g_dof_pass.prog,
+        g_bloom.bright.prog, g_bloom.downsample.prog, g_bloom.upsample.prog,
+        g_capture.pass.prog, g_probes.bake_pass.prog,
+        g_sh.project.prog, g_sh.reconstruct.prog, g_sg.fit.prog);
+    EM_ASM({ alert(UTF8ToString($0)); }, _msg);
 
     emscripten_set_main_loop(frame, 0, 1);
     return 0;
