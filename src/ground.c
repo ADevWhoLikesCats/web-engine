@@ -45,9 +45,9 @@ Mesh ground_create(float y_level, float half_size) {
 
     /* Material */
     m.material = (Material){0};
-    m.material.basecolor_factor = v3(0.35f, 0.36f, 0.38f);
+    m.material.basecolor_factor = v3(0.10f, 0.10f, 0.12f);
     m.material.metallic_factor  = 0.0f;
-    m.material.roughness_factor = 0.35f;
+    m.material.roughness_factor = 0.9;
     m.material.normal_scale     = 1.0f;
     m.material.occlusion_strength = 1.0f;
     m.material.emissive_strength  = 1.0f;

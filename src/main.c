@@ -24,6 +24,7 @@
 static GLuint prog;
 static GLint  u_model, u_viewproj, u_normalmat;
 static GLint  u_ssrcolor, u_ssrdepth, u_viewproj_mat, u_resolution;
+static GLint  u_ssao;
 static GLint  u_campos, u_lightdir, u_lightcolor, u_lightintensity;
 static GLint  u_debugmode;
 static GLint  u_sh, u_sg, u_sgcount;
@@ -38,6 +39,10 @@ static Framebuffer g_sh_recon_fb;
 static Framebuffer g_ssr_fb;
 static Framebuffer g_taa_history[2];    /* ping-pong */
 static Framebuffer g_dof_fb;
+static Framebuffer g_ssao_fb;
+static Framebuffer g_ssao_blur_fb;
+static Pass        g_ssao_pass;
+static Pass        g_ssao_blur_pass;
 static Pass        g_dof_pass;
 static float       g_focus_distance = 4.0f;
 static float       g_focus_range = 6.0f;
@@ -144,7 +149,7 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
     (void)user;
     if (event_type != EMSCRIPTEN_EVENT_KEYDOWN) return EM_FALSE;
     if (e->key[0] == 'm' || e->key[0] == 'M') {
-        g_debug_mode = (g_debug_mode + 1) % 14;
+        g_debug_mode = (g_debug_mode + 1) % 15;
         printf("debug mode -> %d\n", g_debug_mode);
     }
     if (e->key[0] == 't' || e->key[0] == 'T') {
@@ -190,6 +195,10 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
 static void create_scene_fb(int w, int h) {
     if (g_scene_fb.fbo) fb_destroy(&g_scene_fb);
     g_scene_fb = fb_create_with_depth_tex(w, h, FB_RGBA16F);
+    if (g_ssao_fb.fbo) fb_destroy(&g_ssao_fb);
+    if (g_ssao_blur_fb.fbo) fb_destroy(&g_ssao_blur_fb);
+    g_ssao_fb = fb_create(w, h, FB_R8);
+    g_ssao_blur_fb = fb_create(w, h, FB_R8);
 }
 
 static void sync_canvas_size(void) {
@@ -260,6 +269,7 @@ static void init(void) {
     u_ssrdepth         = glGetUniformLocation(prog, "uSSRDepth");
     u_viewproj_mat     = glGetUniformLocation(prog, "uViewProj");
     u_resolution       = glGetUniformLocation(prog, "uResolution");
+    u_ssao             = glGetUniformLocation(prog, "uSSAO");
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
@@ -290,6 +300,8 @@ static void init(void) {
     g_taa_pass = pass_create("/shaders/fullscreen.vert", "/shaders/taa_resolve.frag");
     printf("[create] g_taa_pass=%u\n", g_taa_pass.prog);
     g_dof_pass = pass_create("/shaders/fullscreen.vert", "/shaders/dof.frag");
+    g_ssao_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssao.frag");
+    g_ssao_blur_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssao_blur.frag");
     printf("[create] g_dof_pass=%u\n", g_dof_pass.prog);
 
     printf("Loading %s...\n", CAR_PATH);
@@ -459,6 +471,10 @@ static void draw_car_into_fb(int w, int h, vec3 cam) {
     glUniform1i(u_probes, 9);
     glActiveTexture(GL_TEXTURE10);
     glBindTexture(GL_TEXTURE_2D, g_ssr_fb.color);
+    glActiveTexture(GL_TEXTURE12);
+    glBindTexture(GL_TEXTURE_2D, g_ssao_blur_fb.color);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(u_ssao, 12);
     glActiveTexture(GL_TEXTURE11);
     glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
     glActiveTexture(GL_TEXTURE0);
@@ -717,6 +733,83 @@ static void frame(void) {
         glEnable(GL_CULL_FACE);
     }
     check_gl_errors("scene render");
+
+    /* SSAO pass: compute ambient occlusion from scene depth */
+    {
+        /* Build view-projection matrix (same as scene) */
+        vec3 ssao_target = v3(0,0,0);
+        vec3 ssao_up = v3(0,1,0);
+        mat4 ssao_view = m4_look_at(cam, ssao_target, ssao_up);
+        mat4 ssao_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                        (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                        0.1f, 200.0f);
+        mat4 ssao_vp = m4_mul(ssao_proj, ssao_view);
+
+        /* Compute inverse view-projection */
+        float ssao_inv_vp[16];
+        {
+            const float* m = ssao_vp.m;
+            float inv[16];
+            inv[0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8] =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2] =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7] =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) ssao_inv_vp[i] = inv[i] * invdet;
+        }
+
+        /* Pass 1: SSAO */
+        fb_bind(&g_ssao_fb);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(1, 1, 1, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_ssao_pass);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
+        pass_set_i32(&g_ssao_pass, "uSceneDepth", 0);
+
+        GLint loc = glGetUniformLocation(g_ssao_pass.prog, "uInvViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, ssao_inv_vp);
+        loc = glGetUniformLocation(g_ssao_pass.prog, "uViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, ssao_vp.m);
+
+        pass_set_vec3(&g_ssao_pass, "uCamPos", cam);
+        vec2 res = { (float)g_scene_fb.width, (float)g_scene_fb.height };
+        pass_set_vec2(&g_ssao_pass, "uResolution", res);
+        pass_set_f32(&g_ssao_pass, "uRadius", 0.5f);
+        pass_set_f32(&g_ssao_pass, "uBias", 0.02f);
+        pass_set_f32(&g_ssao_pass, "uIntensity", 1.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        /* Pass 2: Blur */
+        fb_bind(&g_ssao_blur_fb);
+        glClear(GL_COLOR_BUFFER_BIT);
+        pass_use(&g_ssao_blur_pass);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_ssao_fb.color);
+        pass_set_i32(&g_ssao_blur_pass, "uSSAO", 0);
+        vec2 inv_res = { 1.0f / (float)g_ssao_fb.width, 1.0f / (float)g_ssao_fb.height };
+        pass_set_vec2(&g_ssao_blur_pass, "uInvResolution", inv_res);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
 
     /* SSR pass: reads scene color + depth, writes SSR reflections */
     {
@@ -1033,7 +1126,9 @@ static void frame(void) {
     }
 
     /* Bloom: bright pass + downsample + upsample chain */
-    bloom_run(&g_bloom, final_hdr, 0.8f);
+    if (g_debug_mode != 12) if (g_debug_mode != 14) {
+        bloom_run(&g_bloom, final_hdr, 2.0f);
+    }  /* skip bloom in mode 12 */
 
     /* Ensure we're not still bound to a bloom mip when the composite samples it */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);

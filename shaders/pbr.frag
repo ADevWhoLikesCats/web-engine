@@ -23,6 +23,7 @@ uniform sampler2D uProbeSGs;
 uniform vec3      uSceneGridMin;
 uniform vec3      uSceneGridMax;
 uniform sampler2D uSSRColor;
+uniform sampler2D uSSAO;
 uniform sampler2D uSSRDepth;
 uniform mat4      uViewProj;
 uniform vec2      uResolution;
@@ -241,12 +242,31 @@ void main() {
     vec3 indirect_diffuse = kD * albedo / PI * E_ambient;
 
         /* --- Indirect specular: SG only (SSR composited post) --- */
-    vec3 sg_refl = sg_specular(vWorldPos, R, roughness);
-
+        vec3 sg_refl = sg_specular(vWorldPos, R, roughness);
     vec3 F_indirect = F_Schlick(F0, NdotV);
     float roughAtten = 1.0 - roughness * 0.6;
-    vec3 indirect_specular = sg_refl * F_indirect * roughAtten;
 
-    vec3 color = direct + indirect_diffuse + indirect_specular;
+    /* Attenuate SG reflections on ground-like surfaces (normal ~ up).
+       This keeps reflections on the car (varied normals) but dims them on
+       the flat ground, preventing the car-shaped ghost from appearing
+       high on the plane at grazing angles. */
+    float upness = abs(N.y);
+    float ground_mask = 1.0 - smoothstep(0.5, 0.9, upness);
+
+    /* Clamp brightness to avoid outlier SG lobes producing pinpoint specks */
+    vec3 indirect_specular = min(sg_refl * F_indirect * roughAtten * ground_mask,
+                                 vec3(2.0));
+
+    /* Grazing-angle fade: at extreme angles, reflections stretch into
+       horizontal streaks. Smoothly reduce them as NdotV -> 0. */
+    float grazing = smoothstep(0.02, 0.15, NdotV);
+    indirect_specular *= grazing;
+
+    /* Sample AO at this fragment's screen position */
+    vec2 ao_uv = gl_FragCoord.xy / uResolution;
+    float ao = texture(uSSAO, ao_uv).r;
+
+    /* Modulate only indirect lighting by AO — direct light is unaffected */
+    vec3 color = direct + (indirect_diffuse + indirect_specular) * ao;
     fragColor = vec4(color, 1.0);
 }
