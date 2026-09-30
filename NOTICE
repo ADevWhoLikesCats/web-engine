@@ -1,6 +1,32 @@
 web-engine
 Copyright 2026 The web-engine Authors
 
-This product includes software developed by the web-engine contributors.
+------------------------------------------------------------------------
+Third-party software
+------------------------------------------------------------------------
 
-Credits to AnatolianStudios on cgtrader.com for the engine demo model.
+cgltf — MIT License
+Copyright (c) 2018-2021 Johannes Kuhlmann
+https://github.com/jkuhlmann/cgltf
+
+stb_image — MIT License / Public Domain (dual-licensed)
+Copyright (c) 2017 Sean Barrett
+https://github.com/nothings/stb
+
+------------------------------------------------------------------------
+Third-party assets
+------------------------------------------------------------------------
+
+Car model: "Lamborghiini Revuelto free low-poly 3d model"
+Author: AnatolianStudios
+Source: https://www.cgtrader.com/3d-models/car/sport-car/toyota-2000gt-rigged
+License: Commercial (purchased via CGTrader)
+
+HDRI environment: studio_small_09
+Author: Poly Haven
+Source: https://polyhaven.com/a/studio_small_09
+License: CC0 (Public Domain)
+
+------------------------------------------------------------------------
+End of NOTICE
+------------------------------------------------------------------------
