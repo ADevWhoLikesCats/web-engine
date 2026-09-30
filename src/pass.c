@@ -101,6 +101,25 @@ Pass pass_create(const char* vert_path, const char* frag_path) {
         abort();
     }
 
+    /* Intel HD Graphics 400/500 series require at least one enabled vertex
+       attribute for a draw call to rasterize, even for gl_VertexID-only
+       shaders. Bind a dummy 1-element position attribute. */
+    glBindVertexArray(p.vao);
+
+    GLuint dummy_vbo = 0;
+    glGenBuffers(1, &dummy_vbo);
+    static const float dummy_pos[3] = { 0.0f, 0.0f, 0.0f };
+    glBindBuffer(GL_ARRAY_BUFFER, dummy_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(dummy_pos), dummy_pos, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+
+    /* The VBO is referenced by the VAO for the lifetime of the pass.
+       Do not delete it — deleting would invalidate the VAO. */
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
     /* Final verification: bind the program and the VAO and confirm the
        full state is valid. */
     glUseProgram(p.prog);

@@ -600,10 +600,44 @@ static void frame(void) {
     glClear(GL_COLOR_BUFFER_BIT);
     sh_reconstruct(&g_sh, g_sh_recon_fb.width, g_sh_recon_fb.height, 1.0f);
 
+    
+    check_gl_errors("sky pass");
+
+    /* Shadow pass */
+    {
+        vec3 sc = model_center(&g_car);
+        vec3 ext = model_extent(&g_car);
+        float r = ext.x; if (ext.y > r) r = ext.y; if (ext.z > r) r = ext.z;
+        r *= 0.55f;
+        sc = v3(sc.x * 1.0f, sc.y * 1.0f, sc.z * 1.0f);
+        /* Center in world: apply the car's auto-scale/centering */
+        vec3 centerWorld = v3(0.0f, 0.0f, 0.0f);
+        /* Radius in world units after scaling ~3 units long => use fixed 3 */
+        float radiusWorld = 3.0f;
+        shadow_update_matrix(&g_shadow, centerWorld, radiusWorld, light_dir);
+        shadow_render(&g_shadow, g_car.meshes, g_car.count);
+    }
+
+    /* Scene */
+    fb_bind(&g_scene_fb);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    draw_car_into_fb(g_scene_fb.width, g_scene_fb.height, cam);
+
+    /* Sky pass (AFTER scene, so the scene doesn't erase it) */
     /* Sky background pass */
+    if (g_frame_index < 3) {
+        printf("[sky] check: valid=%d prog=%u fbo=%u color=%u depth=%u\n",
+               g_hdr_env.valid, g_sky_pass.prog,
+               g_scene_fb.fbo, g_scene_fb.color, g_scene_fb.depth);
+    }
     if (g_hdr_env.valid && g_sky_pass.prog) {
+        printf("[sky] running: hdr_tex=%u prog=%u\n", g_hdr_env.tex, g_sky_pass.prog);
         fb_bind(&g_scene_fb);
-        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
         glDisable(GL_CULL_FACE);
 
         /* Unbind all textures to prevent feedback warnings */
@@ -658,35 +692,30 @@ static void frame(void) {
         vec2 sky_inv_res = { 1.0f / (float)g_scene_fb.width, 1.0f / (float)g_scene_fb.height };
         pass_set_vec2(&g_sky_pass, "uInvResolution", sky_inv_res);
 
+        
+        {
+            GLint _linked = 0;
+            glGetProgramiv(g_sky_pass.prog, GL_LINK_STATUS, &_linked);
+            GLenum _fb = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            GLenum _pre = glGetError();
+            printf("[sky] linked=%d prog=%u vao=%u fb_status=0x%04X pre_err=0x%04X\n",
+                   _linked, g_sky_pass.prog, g_sky_pass.vao, _fb, _pre);
+            while (glGetError() != GL_NO_ERROR) {}
+        }
+        
         glDrawArrays(GL_TRIANGLES, 0, 3);
+        {
+            GLenum _post = glGetError();
+            if (_post != GL_NO_ERROR) {
+                printf("[sky] error AFTER draw: 0x%04X\n", _post);
+                while (glGetError() != GL_NO_ERROR) {}
+            }
+        }
+
 
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_CULL_FACE);
     }
-    check_gl_errors("sky pass");
-
-    /* Shadow pass */
-    {
-        vec3 sc = model_center(&g_car);
-        vec3 ext = model_extent(&g_car);
-        float r = ext.x; if (ext.y > r) r = ext.y; if (ext.z > r) r = ext.z;
-        r *= 0.55f;
-        sc = v3(sc.x * 1.0f, sc.y * 1.0f, sc.z * 1.0f);
-        /* Center in world: apply the car's auto-scale/centering */
-        vec3 centerWorld = v3(0.0f, 0.0f, 0.0f);
-        /* Radius in world units after scaling ~3 units long => use fixed 3 */
-        float radiusWorld = 3.0f;
-        shadow_update_matrix(&g_shadow, centerWorld, radiusWorld, light_dir);
-        shadow_render(&g_shadow, g_car.meshes, g_car.count);
-    }
-
-    /* Scene */
-    fb_bind(&g_scene_fb);
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
-    glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    draw_car_into_fb(g_scene_fb.width, g_scene_fb.height, cam);
     check_gl_errors("scene render");
 
     /* SSR pass: reads scene color + depth, writes SSR reflections */
