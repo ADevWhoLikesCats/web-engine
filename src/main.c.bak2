@@ -823,6 +823,7 @@ static void frame(void) {
     }
 
     /* Volumetric fog pass */
+    if (g_fog_enabled) {
         /* Build view-projection + inverse */
         vec3 fog_target = v3(0,0,0);
         vec3 fog_up = v3(0,1,0);
@@ -899,6 +900,28 @@ static void frame(void) {
 
         glDrawArrays(GL_TRIANGLES, 0, 3);
 
+        /* Pass 2: composite fog into scene */
+        fb_bind(&g_fog_composited_fb);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_fog_composite_pass);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
+        pass_set_i32(&g_fog_composite_pass, "uSceneColor", 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_fog_fb.color);
+        pass_set_i32(&g_fog_composite_pass, "uFogTexture", 1);
+
+        vec2 inv = { 1.0f / (float)g_fog_composited_fb.width,
+                     1.0f / (float)g_fog_composited_fb.height };
+        pass_set_vec2(&g_fog_composite_pass, "uInvResolution", inv);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
 
     /* SSR pass: reads scene color + depth, writes SSR reflections */
     {
@@ -1042,32 +1065,6 @@ static void frame(void) {
         glEnable(GL_CULL_FACE);
     }
 
-    /* Fog composite (moved after SSR composite) */
-    if (g_fog_enabled) {
-        /* Pass 2: composite fog into scene */
-        fb_bind(&g_fog_composited_fb);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        pass_use(&g_fog_composite_pass);
-
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
-        pass_set_i32(&g_fog_composite_pass, "uSceneColor", 0);
-
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, g_fog_fb.color);
-        pass_set_i32(&g_fog_composite_pass, "uFogTexture", 1);
-
-        vec2 inv = { 1.0f / (float)g_fog_composited_fb.width,
-                     1.0f / (float)g_fog_composited_fb.height };
-        pass_set_vec2(&g_fog_composite_pass, "uInvResolution", inv);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-
-        glEnable(GL_DEPTH_TEST);
-        glEnable(GL_CULL_FACE);
-    }
-
-
     /* TAA resolve: composite -> TAA history */
     if (g_taa_enabled) {
         int curr = g_taa_ping;
@@ -1082,7 +1079,7 @@ static void frame(void) {
             pass_use(&g_blit_pass);
     check_gl_errors("after pass_use");
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, g_fog_composited_fb.color);
+            glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
             pass_set_tex(&g_blit_pass, "uScene", 0);
             vec2 inv0 = { 1.0f / (float)g_composite_fb.width, 1.0f / (float)g_composite_fb.height };
             pass_set_vec2(&g_blit_pass, "uInvSize", inv0);
@@ -1099,7 +1096,7 @@ static void frame(void) {
     check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_fog_composited_fb.color);
+        glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
         pass_set_i32(&g_taa_pass, "uCurrentColor", 0);
 
         glActiveTexture(GL_TEXTURE1);
@@ -1166,7 +1163,7 @@ static void frame(void) {
     }
 
     /* Pick the source HDR buffer */
-    Framebuffer* final_hdr = g_taa_enabled ? &g_taa_history[1 - g_taa_ping] : &g_fog_composited_fb;
+    Framebuffer* final_hdr = g_taa_enabled ? &g_taa_history[1 - g_taa_ping] : &g_composite_fb;
 
     /* DOF: read scene color + depth, write to g_dof_fb */
     if (g_dof_enabled && g_dof_fb.fbo) {
