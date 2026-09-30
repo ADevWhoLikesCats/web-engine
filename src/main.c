@@ -1081,6 +1081,20 @@ int main(void) {
     printf("GL_RENDERER = %s\n", glGetString(GL_RENDERER));
 
     init();
+    printf("=== program map ===\n");
+    printf("blit=%u octa=%u sky=%u\n",
+           g_blit_pass.prog, g_octa_debug_pass.prog, g_sky_pass.prog);
+    printf("ssr=%u ssr_comp=%u bloom_comp=%u bloom_dbg=%u\n",
+           g_ssr_pass.prog, g_ssr_composite_pass.prog,
+           g_bloom_composite_pass.prog, g_bloom_debug_pass.prog);
+    printf("taa=%u dof=%u\n", g_taa_pass.prog, g_dof_pass.prog);
+    printf("bloom: b=%u d=%u u=%u\n",
+           g_bloom.bright.prog, g_bloom.downsample.prog, g_bloom.upsample.prog);
+    printf("capture=%u probes_bake=%u\n",
+           g_capture.pass.prog, g_probes.bake_pass.prog);
+    printf("sh_proj=%u sh_recon=%u sg=%u\n",
+           g_sh.project.prog, g_sh.reconstruct.prog, g_sg.fit.prog);
+
     emscripten_set_main_loop(frame, 0, 1);
     return 0;
 }
