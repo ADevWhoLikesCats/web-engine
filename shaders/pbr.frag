@@ -39,6 +39,8 @@ uniform vec3  uBasecolorFactor;
 uniform float uMetallicFactor;
 uniform float uRoughnessFactor;
 uniform float uNormalScale;
+uniform int   uHasEmissive;
+uniform float uEmissiveStrength;
 
 uniform int uHasBasecolor;
 uniform int uHasMR;
@@ -48,7 +50,10 @@ uniform int uHasNormal;
 uniform sampler2D uShadowMap;
 uniform int       uShadowEnabled;
 
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
+layout(location = 1) out vec4 gAlbedo;
+layout(location = 2) out vec4 gNormal;
+layout(location = 3) out vec4 gEmissive;
 
 const float PI = 3.14159265359;
 
@@ -153,6 +158,14 @@ vec3 ssr_sample(vec2 uv) {
     return ssr.rgb * ssr.a;
 }
 
+
+/* Debug visualizations go to attachment 0 only. The G-buffer outputs
+   are intentionally NOT touched here — writing them would poison the
+   buffers that SSGI (and mode 14) reads. */
+void write_debug(vec3 c) {
+    fragColor = vec4(c, 1.0);
+}
+
 void main() {
     /* --- Material sample --- */
     vec3 albedo = uBasecolorFactor;
@@ -167,6 +180,13 @@ void main() {
     }
     roughness = clamp(roughness, 0.04, 1.0);
     metallic  = clamp(metallic, 0.0, 1.0);
+
+    /* Emissive radiance — sampled unconditionally so the G-buffer
+       emissive attachment always has the right value. */
+    vec3 emissive_radiance = vec3(0.0);
+    if (uHasEmissive == 1) {
+        emissive_radiance = texture(uTexEmissive, vUV).rgb * uEmissiveStrength;
+    }
 
     /* --- Normal (with normal map) --- */
     vec3 N = normalize(vNormal);
@@ -191,37 +211,37 @@ void main() {
     vec3 kD = (vec3(1.0) - F_Schlick(F0, VdotH)) * (1.0 - metallic);
 
     /* --- Debug views --- */
-    if (uDebugMode == 1) { fragColor = vec4(albedo / PI, 1.0); return; }
+    if (uDebugMode == 1) { write_debug(albedo / PI); return; }
     if (uDebugMode == 2) {
         vec3 spec = evalSpecular(F0, roughness, NdotV, NdotL, NdotH, VdotH);
-        fragColor = vec4(spec, 1.0); return;
+        write_debug(spec); return;
     }
-    if (uDebugMode == 3) { fragColor = vec4(F_Schlick(F0, VdotH), 1.0); return; }
-    if (uDebugMode == 4) { fragColor = vec4(vec3(roughness), 1.0); return; }
-    if (uDebugMode == 5) { fragColor = vec4(vec3(metallic), 1.0); return; }
-    if (uDebugMode == 6) { fragColor = vec4(sh_irradiance(N), 1.0); return; }
-    if (uDebugMode == 7) { fragColor = vec4(N * 0.5 + 0.5, 1.0); return; }
+    if (uDebugMode == 3) { write_debug(F_Schlick(F0, VdotH)); return; }
+    if (uDebugMode == 4) { write_debug(vec3(roughness)); return; }
+    if (uDebugMode == 5) { write_debug(vec3(metallic)); return; }
+    if (uDebugMode == 6) { write_debug(sh_irradiance(N)); return; }
+    if (uDebugMode == 7) { write_debug(N * 0.5 + 0.5); return; }
     if (uDebugMode == 8) {
         vec3 refl = sg_specular(vWorldPos, R, roughness);
-        fragColor = vec4(refl, 1.0); return;
+        write_debug(refl); return;
     }
-    if (uDebugMode == 9) { fragColor = vec4(R * 0.5 + 0.5, 1.0); return; }
+    if (uDebugMode == 9) { write_debug(R * 0.5 + 0.5); return; }
     if (uDebugMode == 10) {
         float bias = max(0.0015 * (1.0 - NdotL), 0.0005);
         float s = (uShadowEnabled == 1) ? hard_shadow(vLightSpacePos, bias) : 1.0;
-        fragColor = vec4(vec3(1.0 - s), 1.0);
+        write_debug(vec3(1.0 - s));
         return;
     }
 
     if (uDebugMode == 12) {
         vec2 suv = gl_FragCoord.xy / uResolution;
-        fragColor = texture(uSSRColor, suv);
+        write_debug(texture(uSSRColor, suv).rgb);
         return;
     }
     if (uDebugMode == 11) {
         vec3 span = max(uSceneGridMax - uSceneGridMin, vec3(1e-4));
         vec3 t = clamp((vWorldPos - uSceneGridMin) / span, 0.0, 1.0);
-        fragColor = vec4(t, 1.0);
+        write_debug(t);
         return;
     }
 
@@ -267,6 +287,10 @@ void main() {
     float ao = texture(uSSAO, ao_uv).r;
 
     /* Modulate only indirect lighting by AO — direct light is unaffected */
-    vec3 color = direct + (indirect_diffuse + indirect_specular) * ao;
-    fragColor = vec4(color, 1.0);
+    vec3 color = direct + (indirect_diffuse + indirect_specular) * ao + emissive_radiance;
+
+    fragColor = vec4(color, 1.0);                   /* lit scene */
+    gAlbedo   = vec4(albedo, ao);                   /* albedo + AO */
+    gNormal   = vec4(N * 0.5 + 0.5, roughness);     /* normal + rough */
+    gEmissive = vec4(emissive_radiance, 1.0);       /* emissive */
 }
