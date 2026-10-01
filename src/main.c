@@ -47,6 +47,7 @@ static Framebuffer g_fog_composited_fb;
 static int         g_fog_enabled = 1;
 static Framebuffer g_ssao_blur_fb;
 static Framebuffer g_depth_probe_fb;
+static Framebuffer g_gbuffer[2];
 static Pass        g_depth_probe_pass;
 static Pass        g_ssao_pass;
 static Pass        g_ssao_blur_pass;
@@ -214,6 +215,12 @@ static void create_scene_fb(int w, int h) {
     g_fog_fb = fb_create(w/2, h/2, FB_RGBA16F);
     g_fog_composited_fb = fb_create(w, h, FB_RGBA16F);
     g_ssao_blur_fb = fb_create(w, h, FB_R8);
+
+    /* G-buffer pair: MRT attachments + borrowed depth from g_scene_fb. */
+    if (g_gbuffer[0].fbo) fb_destroy(&g_gbuffer[0]);
+    if (g_gbuffer[1].fbo) fb_destroy(&g_gbuffer[1]);
+    g_gbuffer[0] = fb_create_gbuffer(w, h, g_scene_fb.depth);
+    g_gbuffer[1] = fb_create_gbuffer(w, h, g_scene_fb.depth);
 }
 
 static void sync_canvas_size(void) {
@@ -792,13 +799,18 @@ static void frame(void) {
         shadow_render(&g_shadow, g_car.meshes, g_car.count);
     }
 
-    /* Scene */
-    fb_bind(&g_scene_fb);
+    /* Scene -> G-buffer */
+    fb_bind(&g_gbuffer[0]);
+    {
+        GLenum bufs[4] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+                           GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3 };
+        glDrawBuffers(4, bufs);
+    }
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
     glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    draw_car_into_fb(g_scene_fb.width, g_scene_fb.height, cam);
+    draw_car_into_fb(g_gbuffer[0].width, g_gbuffer[0].height, cam);
 
     /* Sky pass (AFTER scene, so the scene doesn't erase it) */
     /* Sky background pass */
@@ -809,7 +821,14 @@ static void frame(void) {
     }
     if (g_hdr_env.valid && g_sky_pass.prog) {
         if (g_frame_index < 3) printf("[sky] running: hdr_tex=%u prog=%u\n", g_hdr_env.tex, g_sky_pass.prog);
-        fb_bind(&g_scene_fb);
+        fb_bind(&g_gbuffer[0]);
+        {
+            /* Sky shader has only one output. Only enable attachment 0
+               so the draw call succeeds; attachments 1-3 keep their
+               clear values from the scene pass. */
+            GLenum bufs[1] = { GL_COLOR_ATTACHMENT0 };
+            glDrawBuffers(1, bufs);
+        }
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         glDisable(GL_CULL_FACE);
@@ -891,6 +910,20 @@ static void frame(void) {
         glEnable(GL_CULL_FACE);
     }
     check_gl_errors("scene render");
+
+    /* Blit G-buffer attachment 0 (lit scene) -> g_scene_fb.color, so the
+       downstream chain (SSR, fog, TAA, bloom, tonemap) is unchanged. */
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gbuffer[0].fbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_scene_fb.fbo);
+        { GLenum _b = GL_COLOR_ATTACHMENT0; glDrawBuffers(1, &_b); }
+        glBlitFramebuffer(0, 0, g_gbuffer[0].width, g_gbuffer[0].height,
+                          0, 0, g_scene_fb.width,  g_scene_fb.height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        fb_bind(&g_scene_fb);
+    }
 
     /* Depth histogram probe (once per second) */
     if (g_probe_enabled && g_frame_index > 0 && (g_frame_index % 60) == 0) {
