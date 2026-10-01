@@ -46,6 +46,8 @@ static Pass        g_fog_composite_pass;
 static Framebuffer g_fog_composited_fb;
 static int         g_fog_enabled = 1;
 static Framebuffer g_ssao_blur_fb;
+static Framebuffer g_depth_probe_fb;
+static Pass        g_depth_probe_pass;
 static Pass        g_ssao_pass;
 static Pass        g_ssao_blur_pass;
 static Pass        g_dof_pass;
@@ -164,6 +166,10 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
     if (e->key[0] == 'o' || e->key[0] == 'O') {
         g_dof_enabled = !g_dof_enabled;
         printf("DOF -> %s\n", g_dof_enabled ? "on" : "off");
+    }
+    if (e->key[0] == 'f' || e->key[0] == 'F') {
+        g_fog_enabled = !g_fog_enabled;
+        printf("Fog -> %s\n", g_fog_enabled ? "on" : "off");
     }
     if (e->key[0] == '-') {
         g_focus_distance -= 0.5f;
@@ -599,6 +605,147 @@ static void check_gl_errors(const char* label) {
     }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Depth histogram probe: measures the visible scene's world-space    */
+/* distance distribution. Used to pick SSGI raymarch parameters.      */
+/* ------------------------------------------------------------------ */
+static int g_probe_enabled = 1;
+
+static int cmp_float(const void* a, const void* b) {
+    float fa = *(const float*)a;
+    float fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static void probe_depth_stats(Framebuffer* fb, vec3 cam, mat4 inv_vp) {
+    if (!g_probe_enabled) return;
+    if (!fb || !fb->fbo) return;
+
+    int w = fb->width;
+    int h = fb->height;
+
+    /* WebGL2 depth-texture readback is implementation-defined and fails on
+       many browsers. Blit the depth texture into an R8 color buffer, then
+       read that color buffer. Precision is 8-bit which is plenty for
+       percentile estimation. */
+    if (!g_depth_probe_fb.fbo || g_depth_probe_fb.width != w || g_depth_probe_fb.height != h) {
+        if (g_depth_probe_fb.fbo) fb_destroy(&g_depth_probe_fb);
+        g_depth_probe_fb = fb_create(w, h, FB_R8);
+    }
+
+    fb_bind(&g_depth_probe_fb);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    pass_use(&g_depth_probe_pass);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, fb->depth);
+    pass_set_i32(&g_depth_probe_pass, "uDepth", 0);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    unsigned char* depth8 = malloc(sizeof(unsigned char) * w * h);
+    if (!depth8) return;
+    glReadPixels(0, 0, w, h, GL_RED, GL_UNSIGNED_BYTE, depth8);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        printf("[probe] glReadPixels failed: 0x%04X\n", err);
+        while (glGetError() != GL_NO_ERROR) {}
+        free(depth8);
+        return;
+    }
+
+    int max_samples = (w / 8 + 1) * (h / 8 + 1);
+    float* dists = malloc(sizeof(float) * max_samples);
+    if (!dists) { free(depth8); return; }
+
+    int n = 0;
+    int sky_count = 0;
+    float min_d = 1e30f, max_d = 0.0f;
+    double sum = 0.0;
+
+    const float* m = inv_vp.m;
+
+    for (int y = 0; y < h; y += 8) {
+        for (int x = 0; x < w; x += 8) {
+            float d = (float)depth8[y * w + x] / 255.0f;
+            if (d >= 0.9999f) { sky_count++; continue; }
+
+            float ndc_x = ((float)x + 0.5f) / (float)w * 2.0f - 1.0f;
+            float ndc_y = ((float)y + 0.5f) / (float)h * 2.0f - 1.0f;
+            float ndc_z = d * 2.0f - 1.0f;
+
+            float wx = m[0]*ndc_x + m[4]*ndc_y + m[8]*ndc_z  + m[12];
+            float wy = m[1]*ndc_x + m[5]*ndc_y + m[9]*ndc_z  + m[13];
+            float wz = m[2]*ndc_x + m[6]*ndc_y + m[10]*ndc_z + m[14];
+            float ww = m[3]*ndc_x + m[7]*ndc_y + m[11]*ndc_z + m[15];
+            if (ww == 0.0f) continue;
+            wx /= ww; wy /= ww; wz /= ww;
+
+            float dx = wx - cam.x;
+            float dy = wy - cam.y;
+            float dz = wz - cam.z;
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+
+            dists[n++] = dist;
+            if (dist < min_d) min_d = dist;
+            if (dist > max_d) max_d = dist;
+            sum += dist;
+        }
+    }
+
+    int total = n + sky_count;
+    if (n == 0) { free(dists); free(depth8); return; }
+
+    qsort(dists, n, sizeof(float), cmp_float);
+
+    float p25 = dists[(int)(n * 0.25f)];
+    float p50 = dists[(int)(n * 0.50f)];
+    float p75 = dists[(int)(n * 0.75f)];
+    float p90 = dists[(int)(n * 0.90f)];
+    float p99 = dists[(int)(n * 0.99f)];
+    float mean = (float)(sum / (double)n);
+
+    double var = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double d = dists[i] - mean;
+        var += d * d;
+    }
+    float sd = (float)sqrt(var / (double)n);
+
+    printf("[probe] depth: min=%.2f p25=%.2f p50=%.2f p75=%.2f p90=%.2f p99=%.2f max=%.2f mean=%.2f sd=%.2f sky=%.0f%%\n",
+           min_d, p25, p50, p75, p90, p99, max_d, mean, sd,
+           100.0f * (float)sky_count / (float)total);
+
+    /* Write probe results into a DOM overlay so they're visible without
+       the dev console. */
+    {
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "p75=%.2f p90=%.2f p50=%.2f sky=%.0f%% sd=%.2f",
+                 p75, p90, p50,
+                 100.0f * (float)sky_count / (float)total, sd);
+        EM_ASM({
+            var el = document.getElementById('probe-overlay');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'probe-overlay';
+                el.style.cssText =
+                    'position:fixed;top:0;left:0;background:rgba(0,0,0,0.75);' +
+                    'color:#0f0;font:14px monospace;padding:6px 10px;z-index:99999;' +
+                    'pointer-events:none;';
+                document.body.appendChild(el);
+            }
+            el.textContent = UTF8ToString($0);
+        }, line);
+    }
+
+    free(dists);
+    free(depth8);
+}
+
 static void frame(void) {
     sync_canvas_size();
 
@@ -661,7 +808,7 @@ static void frame(void) {
                g_scene_fb.fbo, g_scene_fb.color, g_scene_fb.depth);
     }
     if (g_hdr_env.valid && g_sky_pass.prog) {
-        printf("[sky] running: hdr_tex=%u prog=%u\n", g_hdr_env.tex, g_sky_pass.prog);
+        if (g_frame_index < 3) printf("[sky] running: hdr_tex=%u prog=%u\n", g_hdr_env.tex, g_sky_pass.prog);
         fb_bind(&g_scene_fb);
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
@@ -725,7 +872,7 @@ static void frame(void) {
             glGetProgramiv(g_sky_pass.prog, GL_LINK_STATUS, &_linked);
             GLenum _fb = glCheckFramebufferStatus(GL_FRAMEBUFFER);
             GLenum _pre = glGetError();
-            printf("[sky] linked=%d prog=%u vao=%u fb_status=0x%04X pre_err=0x%04X\n",
+            if (g_frame_index < 3) printf("[sky] linked=%d prog=%u vao=%u fb_status=0x%04X pre_err=0x%04X\n",
                    _linked, g_sky_pass.prog, g_sky_pass.vao, _fb, _pre);
             while (glGetError() != GL_NO_ERROR) {}
         }
@@ -744,6 +891,45 @@ static void frame(void) {
         glEnable(GL_CULL_FACE);
     }
     check_gl_errors("scene render");
+
+    /* Depth histogram probe (once per second) */
+    if (g_probe_enabled && g_frame_index > 0 && (g_frame_index % 60) == 0) {
+        vec3 probe_target = v3(0,0,0);
+        vec3 probe_up = v3(0,1,0);
+        mat4 probe_view = m4_look_at(cam, probe_target, probe_up);
+        mat4 probe_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                         (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                         0.1f, 200.0f);
+        mat4 probe_vp = m4_mul(probe_proj, probe_view);
+
+        float probe_inv[16];
+        {
+            const float* m = probe_vp.m;
+            float inv[16];
+            inv[0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8] =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2] =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7] =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) probe_inv[i] = inv[i] * invdet;
+        }
+        mat4 inv_mat;
+        for (int i = 0; i < 16; ++i) inv_mat.m[i] = probe_inv[i];
+        probe_depth_stats(&g_scene_fb, cam, inv_mat);
+    }
 
     /* SSAO pass: compute ambient occlusion from scene depth */
     {
@@ -823,6 +1009,7 @@ static void frame(void) {
     }
 
     /* Volumetric fog pass */
+    if (g_fog_enabled) {
         /* Build view-projection + inverse */
         vec3 fog_target = v3(0,0,0);
         vec3 fog_up = v3(0,1,0);
@@ -898,6 +1085,54 @@ static void frame(void) {
         pass_set_f32(&g_fog_raymarch_pass, "uAmbientScatter", 0.15f);
 
         glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        /* Pass 2: composite fog into scene */
+        fb_bind(&g_fog_composited_fb);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_fog_composite_pass);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
+        pass_set_i32(&g_fog_composite_pass, "uSceneColor", 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_fog_fb.color);
+        pass_set_i32(&g_fog_composite_pass, "uFogTexture", 1);
+
+        vec2 inv = { 1.0f / (float)g_fog_composited_fb.width,
+                     1.0f / (float)g_fog_composited_fb.height };
+        pass_set_vec2(&g_fog_composite_pass, "uInvResolution", inv);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
+    else {
+        /* Fog disabled: blit the SSR-composited scene straight through
+           so downstream passes still have a valid input. Clean scene,
+           no fog. */
+        fb_bind(&g_fog_composited_fb);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_blit_pass);
+        check_gl_errors("after pass_use");
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
+        pass_set_tex(&g_blit_pass, "uScene", 0);
+        vec2 inv = { 1.0f / (float)g_composite_fb.width,
+                     1.0f / (float)g_composite_fb.height };
+        pass_set_vec2(&g_blit_pass, "uInvSize", inv);
+
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
 
 
     /* SSR pass: reads scene color + depth, writes SSR reflections */
@@ -1042,32 +1277,6 @@ static void frame(void) {
         glEnable(GL_CULL_FACE);
     }
 
-    /* Fog composite (moved after SSR composite) */
-    if (g_fog_enabled) {
-        /* Pass 2: composite fog into scene */
-        fb_bind(&g_fog_composited_fb);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        pass_use(&g_fog_composite_pass);
-
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
-        pass_set_i32(&g_fog_composite_pass, "uSceneColor", 0);
-
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, g_fog_fb.color);
-        pass_set_i32(&g_fog_composite_pass, "uFogTexture", 1);
-
-        vec2 inv = { 1.0f / (float)g_fog_composited_fb.width,
-                     1.0f / (float)g_fog_composited_fb.height };
-        pass_set_vec2(&g_fog_composite_pass, "uInvResolution", inv);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-
-        glEnable(GL_DEPTH_TEST);
-        glEnable(GL_CULL_FACE);
-    }
-
-
     /* TAA resolve: composite -> TAA history */
     if (g_taa_enabled) {
         int curr = g_taa_ping;
@@ -1082,7 +1291,7 @@ static void frame(void) {
             pass_use(&g_blit_pass);
     check_gl_errors("after pass_use");
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, g_fog_composited_fb.color);
+            glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
             pass_set_tex(&g_blit_pass, "uScene", 0);
             vec2 inv0 = { 1.0f / (float)g_composite_fb.width, 1.0f / (float)g_composite_fb.height };
             pass_set_vec2(&g_blit_pass, "uInvSize", inv0);
@@ -1099,7 +1308,7 @@ static void frame(void) {
     check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_fog_composited_fb.color);
+        glBindTexture(GL_TEXTURE_2D, g_composite_fb.color);
         pass_set_i32(&g_taa_pass, "uCurrentColor", 0);
 
         glActiveTexture(GL_TEXTURE1);
@@ -1166,7 +1375,7 @@ static void frame(void) {
     }
 
     /* Pick the source HDR buffer */
-    Framebuffer* final_hdr = g_taa_enabled ? &g_taa_history[1 - g_taa_ping] : &g_fog_composited_fb;
+    Framebuffer* final_hdr = g_taa_enabled ? &g_taa_history[1 - g_taa_ping] : &g_composite_fb;
 
     /* DOF: read scene color + depth, write to g_dof_fb */
     if (g_dof_enabled && g_dof_fb.fbo) {
