@@ -26,6 +26,7 @@ static GLint  u_model, u_viewproj, u_normalmat;
 static GLint  u_ssrcolor, u_ssrdepth, u_viewproj_mat, u_resolution;
 static GLint  u_ssao;
 static GLint  u_gbuffer_albedo;
+static GLint  u_ssgi;
 static GLint  u_campos, u_lightdir, u_lightcolor, u_lightintensity;
 static GLint  u_debugmode;
 static GLint  u_sh, u_sg, u_sgcount;
@@ -160,7 +161,7 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
     (void)user;
     if (event_type != EMSCRIPTEN_EVENT_KEYDOWN) return EM_FALSE;
     if (e->key[0] == 'm' || e->key[0] == 'M') {
-        g_debug_mode = (g_debug_mode + 1) % 15;
+        g_debug_mode = (g_debug_mode + 1) % 16;
         printf("debug mode -> %d\n", g_debug_mode);
     }
     if (e->key[0] == 't' || e->key[0] == 'T') {
@@ -299,6 +300,7 @@ static void init(void) {
     u_resolution       = glGetUniformLocation(prog, "uResolution");
     u_ssao             = glGetUniformLocation(prog, "uSSAO");
     u_gbuffer_albedo   = glGetUniformLocation(prog, "uGBufferAlbedo");
+    u_ssgi             = glGetUniformLocation(prog, "uSSGI");
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
@@ -516,9 +518,13 @@ static void draw_car_into_fb(int w, int h, vec3 cam) {
     } else {
         glBindTexture(GL_TEXTURE_2D, 0);
     }
+
+    glActiveTexture(GL_TEXTURE14);
+    glBindTexture(GL_TEXTURE_2D, g_ssgi_fb.color);
     glActiveTexture(GL_TEXTURE0);
     glUniform1i(u_ssao, 12);
     glUniform1i(u_gbuffer_albedo, g_debug_mode == 14 ? 13 : 0);
+    glUniform1i(u_ssgi, 14);
     glActiveTexture(GL_TEXTURE11);
     glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
     glActiveTexture(GL_TEXTURE0);

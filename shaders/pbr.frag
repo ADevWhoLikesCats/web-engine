@@ -25,6 +25,7 @@ uniform vec3      uSceneGridMax;
 uniform sampler2D uSSRColor;
 uniform sampler2D uSSAO;
 uniform sampler2D uGBufferAlbedo;
+uniform sampler2D uSSGI;
 uniform sampler2D uSSRDepth;
 uniform mat4      uViewProj;
 uniform vec2      uResolution;
@@ -249,6 +250,12 @@ void main() {
     if (uDebugMode == 14) {
         vec2 suv = gl_FragCoord.xy / uResolution;
         write_debug(texture(uGBufferAlbedo, suv).rgb);
+        return;
+    }
+
+    if (uDebugMode == 15) {
+        vec2 suv = gl_FragCoord.xy / uResolution;
+        write_debug(texture(uSSGI, suv).rgb * 4.0);
         return;
     }
 
