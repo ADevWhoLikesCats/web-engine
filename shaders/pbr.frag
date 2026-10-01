@@ -255,7 +255,7 @@ void main() {
 
     if (uDebugMode == 15) {
         vec2 suv = gl_FragCoord.xy / uResolution;
-        write_debug(texture(uSSGI, suv).rgb * 4.0);
+        write_debug(texture(uSSGI, suv).rgb);
         return;
     }
 
@@ -271,9 +271,19 @@ void main() {
     vec3 specular = evalSpecular(F0, roughness, NdotV, NdotL, NdotH, VdotH) * radiance;
     vec3 direct   = (diffuse + specular) * NdotL * shadow;
 
-    /* --- Indirect diffuse (SH) --- */
+    /* --- Indirect diffuse (SH + SSGI) --- */
     vec3 E_ambient = sh_irradiance(N);
     vec3 indirect_diffuse = kD * albedo / PI * E_ambient;
+
+    /* SSGI: add screen-space indirect light. kD makes it material-aware
+       (metal gets none — it has no diffuse), and the value is scaled by
+       SSGI_SCALE which is the single tuning constant. */
+    {
+        vec2 suv = gl_FragCoord.xy / uResolution;
+        vec3 ssgi = texture(uSSGI, suv).rgb;
+        const float SSGI_SCALE = 1.0;
+        indirect_diffuse += kD * ssgi * SSGI_SCALE;
+    }
 
         /* --- Indirect specular: SG only (SSR composited post) --- */
         vec3 sg_refl = sg_specular(vWorldPos, R, roughness);

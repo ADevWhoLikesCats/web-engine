@@ -65,7 +65,6 @@ void main() {
     /* 8 samples, cosine-weighted hemisphere */
     const int SAMPLES = 8;
     vec3 accum = vec3(0.0);
-    float weight_sum = 0.0;
 
     float jitter = hash(gl_FragCoord.xy);
 
@@ -117,16 +116,13 @@ void main() {
 
         /* Cosine-weighted accumulation (matches the sampling distribution) */
         accum += radiance * NdotL * atten;
-        weight_sum += NdotL * atten;
     }
 
-    if (weight_sum > 0.001) {
-        accum /= weight_sum;
-    }
-
-    /* Scale so the output is physically plausible but visible.
-       This is the one aesthetic constant; 0.4 works well and needs no tuning. */
-    accum *= 0.4;
+    /* Average over SAMPLES. The distance attenuation inside the loop is
+       what weights near hits more than far hits; we must NOT normalize
+       by weight_sum, or the attenuation cancels out and every pixel
+       receives the scene-wide average color. */
+    accum *= (1.0 / float(SAMPLES)) * 0.5;
 
     fragColor = vec4(accum, 1.0);
 }
