@@ -65,6 +65,7 @@ static Pass        g_taa_pass;
 static mat4        g_prev_viewproj;
 static int         g_frame_index = 0;
 static int         g_taa_enabled = 1;
+static int         g_show_debug_overlays = 0;
 static Pass        g_ssr_pass;
 static Pass        g_ssr_composite_pass;
 static HDREnv      g_hdr_env;
@@ -175,6 +176,10 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
     if (e->key[0] == 'f' || e->key[0] == 'F') {
         g_fog_enabled = !g_fog_enabled;
         printf("Fog -> %s\n", g_fog_enabled ? "on" : "off");
+    }
+    if (e->key[0] == 'v' || e->key[0] == 'V') {
+        g_show_debug_overlays = !g_show_debug_overlays;
+        printf("Debug overlays -> %s\n", g_show_debug_overlays ? "on" : "off");
     }
     if (e->key[0] == '-') {
         g_focus_distance -= 0.5f;
@@ -1648,30 +1653,32 @@ static void frame(void) {
     pass_set_vec2(&g_bloom_composite_pass, "uInvSize", inv);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    /* Overlays */
-    glViewport(8, 8, 200, 200);
-    pass_use(&g_octa_debug_pass);
-    check_gl_errors("after pass_use");
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_capture.fb.color);
-    pass_set_tex(&g_octa_debug_pass, "uOcta", 0);
-    vec2 inv2 = { 1.0f / (float)g_capture.fb.width, 1.0f / (float)g_capture.fb.height };
-    pass_set_vec2(&g_octa_debug_pass, "uInvResolution", inv2);
-    pass_set_f32 (&g_octa_debug_pass, "uGain", 1.0f);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    /* Debug overlays — off by default, toggle with V. */
+    if (g_show_debug_overlays) {
+        glViewport(8, 8, 200, 200);
+        pass_use(&g_octa_debug_pass);
+        check_gl_errors("after pass_use");
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_capture.fb.color);
+        pass_set_tex(&g_octa_debug_pass, "uOcta", 0);
+        vec2 inv2 = { 1.0f / (float)g_capture.fb.width, 1.0f / (float)g_capture.fb.height };
+        pass_set_vec2(&g_octa_debug_pass, "uInvResolution", inv2);
+        pass_set_f32 (&g_octa_debug_pass, "uGain", 1.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    glViewport(8, g_screen_h - 200 - 8, 200, 200);
-    pass_use(&g_octa_debug_pass);
-    check_gl_errors("after pass_use");
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_sh_recon_fb.color);
-    pass_set_tex(&g_octa_debug_pass, "uOcta", 0);
-    vec2 inv3 = { 1.0f / (float)g_sh_recon_fb.width, 1.0f / (float)g_sh_recon_fb.height };
-    pass_set_vec2(&g_octa_debug_pass, "uInvResolution", inv3);
-    pass_set_f32 (&g_octa_debug_pass, "uGain", 1.0f);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+        glViewport(8, g_screen_h - 200 - 8, 200, 200);
+        pass_use(&g_octa_debug_pass);
+        check_gl_errors("after pass_use");
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_sh_recon_fb.color);
+        pass_set_tex(&g_octa_debug_pass, "uOcta", 0);
+        vec2 inv3 = { 1.0f / (float)g_sh_recon_fb.width, 1.0f / (float)g_sh_recon_fb.height };
+        pass_set_vec2(&g_octa_debug_pass, "uInvResolution", inv3);
+        pass_set_f32 (&g_octa_debug_pass, "uGain", 1.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    glViewport(0, 0, g_screen_w, g_screen_h);
+        glViewport(0, 0, g_screen_w, g_screen_h);
+    }
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
 
