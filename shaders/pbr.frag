@@ -24,6 +24,7 @@ uniform vec3      uSceneGridMin;
 uniform vec3      uSceneGridMax;
 uniform sampler2D uSSRColor;
 uniform sampler2D uSSAO;
+uniform sampler2D uGBufferAlbedo;
 uniform sampler2D uSSRDepth;
 uniform mat4      uViewProj;
 uniform vec2      uResolution;
@@ -242,6 +243,12 @@ void main() {
         vec3 span = max(uSceneGridMax - uSceneGridMin, vec3(1e-4));
         vec3 t = clamp((vWorldPos - uSceneGridMin) / span, 0.0, 1.0);
         write_debug(t);
+        return;
+    }
+
+    if (uDebugMode == 14) {
+        vec2 suv = gl_FragCoord.xy / uResolution;
+        write_debug(texture(uGBufferAlbedo, suv).rgb);
         return;
     }
 

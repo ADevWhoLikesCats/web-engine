@@ -25,6 +25,7 @@ static GLuint prog;
 static GLint  u_model, u_viewproj, u_normalmat;
 static GLint  u_ssrcolor, u_ssrdepth, u_viewproj_mat, u_resolution;
 static GLint  u_ssao;
+static GLint  u_gbuffer_albedo;
 static GLint  u_campos, u_lightdir, u_lightcolor, u_lightintensity;
 static GLint  u_debugmode;
 static GLint  u_sh, u_sg, u_sgcount;
@@ -292,6 +293,7 @@ static void init(void) {
     u_viewproj_mat     = glGetUniformLocation(prog, "uViewProj");
     u_resolution       = glGetUniformLocation(prog, "uResolution");
     u_ssao             = glGetUniformLocation(prog, "uSSAO");
+    u_gbuffer_albedo   = glGetUniformLocation(prog, "uGBufferAlbedo");
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
@@ -497,8 +499,20 @@ static void draw_car_into_fb(int w, int h, vec3 cam) {
     glBindTexture(GL_TEXTURE_2D, g_ssr_fb.color);
     glActiveTexture(GL_TEXTURE12);
     glBindTexture(GL_TEXTURE_2D, g_ssao_blur_fb.color);
+
+    /* Bind the previous frame's G-buffer albedo only when we're about
+       to read it (mode 14). Binding it in production mode causes a
+       feedback-loop warning because the other G-buffer is the draw
+       target right now. */
+    glActiveTexture(GL_TEXTURE13);
+    if (g_debug_mode == 14) {
+        glBindTexture(GL_TEXTURE_2D, g_gbuffer[1].color1);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
     glActiveTexture(GL_TEXTURE0);
     glUniform1i(u_ssao, 12);
+    glUniform1i(u_gbuffer_albedo, g_debug_mode == 14 ? 13 : 0);
     glActiveTexture(GL_TEXTURE11);
     glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
     glActiveTexture(GL_TEXTURE0);
@@ -1565,6 +1579,14 @@ static void frame(void) {
     glViewport(0, 0, g_screen_w, g_screen_h);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
+
+    /* Swap G-buffer ping-pong. Frame N writes to [0]; after the swap,
+       frame N+1's reads from [1] see frame N's data. */
+    {
+        Framebuffer tmp = g_gbuffer[0];
+        g_gbuffer[0] = g_gbuffer[1];
+        g_gbuffer[1] = tmp;
+    }
 
     g_frame_index++;
 
