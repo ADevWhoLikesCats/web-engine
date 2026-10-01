@@ -49,6 +49,8 @@ static int         g_fog_enabled = 1;
 static Framebuffer g_ssao_blur_fb;
 static Framebuffer g_depth_probe_fb;
 static Framebuffer g_gbuffer[2];
+static Framebuffer g_ssgi_fb;
+static Pass        g_ssgi_pass;
 static Pass        g_depth_probe_pass;
 static Pass        g_ssao_pass;
 static Pass        g_ssao_blur_pass;
@@ -222,6 +224,9 @@ static void create_scene_fb(int w, int h) {
     if (g_gbuffer[1].fbo) fb_destroy(&g_gbuffer[1]);
     g_gbuffer[0] = fb_create_gbuffer(w, h, g_scene_fb.depth);
     g_gbuffer[1] = fb_create_gbuffer(w, h, g_scene_fb.depth);
+
+    if (g_ssgi_fb.fbo) fb_destroy(&g_ssgi_fb);
+    g_ssgi_fb = fb_create(w, h, FB_RGBA16F);
 }
 
 static void sync_canvas_size(void) {
@@ -326,6 +331,7 @@ static void init(void) {
     g_dof_pass = pass_create("/shaders/fullscreen.vert", "/shaders/dof.frag");
     g_ssao_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssao.frag");
     g_ssao_blur_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssao_blur.frag");
+    g_ssgi_pass = pass_create("/shaders/fullscreen.vert", "/shaders/ssgi.frag");
     g_fog_raymarch_pass = pass_create("/shaders/fullscreen.vert", "/shaders/fog_raymarch.frag");
     g_fog_composite_pass = pass_create("/shaders/fullscreen.vert", "/shaders/fog_composite.frag");
     printf("[create] g_dof_pass=%u\n", g_dof_pass.prog);
@@ -924,6 +930,89 @@ static void frame(void) {
         glEnable(GL_CULL_FACE);
     }
     check_gl_errors("scene render");
+
+    /* SSGI pass: reads last frame's G-buffer + this frame's depth,
+       writes indirect diffuse to g_ssgi_fb. Runs at full res. */
+    {
+        fb_bind(&g_ssgi_fb);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        pass_use(&g_ssgi_pass);
+        check_gl_errors("after ssgi pass_use");
+
+        /* Inputs: this frame's scene color + depth, last frame's G-buffer. */
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.color);
+        pass_set_i32(&g_ssgi_pass, "uSceneColor", 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
+        pass_set_i32(&g_ssgi_pass, "uSceneDepth", 1);
+
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, g_gbuffer[1].color1);
+        pass_set_i32(&g_ssgi_pass, "uGBufferAlbedo", 2);
+
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, g_gbuffer[1].color2);
+        pass_set_i32(&g_ssgi_pass, "uGBufferNormal", 3);
+
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, g_gbuffer[1].color3);
+        pass_set_i32(&g_ssgi_pass, "uGBufferEmissive", 4);
+
+        /* ViewProj + its inverse for depth reconstruction (same as other passes). */
+        vec3 ssgi_target = v3(0,0,0);
+        vec3 ssgi_up = v3(0,1,0);
+        mat4 ssgi_view = m4_look_at(cam, ssgi_target, ssgi_up);
+        mat4 ssgi_proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
+                                        (float)g_scene_fb.width / (float)g_scene_fb.height,
+                                        0.1f, 200.0f);
+        mat4 ssgi_vp = m4_mul(ssgi_proj, ssgi_view);
+
+        float ssgi_inv_vp[16];
+        {
+            const float* m = ssgi_vp.m;
+            float inv[16];
+            inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+            inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+            inv[8]  =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+            inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+            inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+            inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+            inv[9]  = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+            inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+            inv[2]  =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+            inv[6]  = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+            inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+            inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+            inv[3]  = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+            inv[7]  =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+            inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+            inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+            float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+            float invdet = 1.0f / det;
+            for (int i = 0; i < 16; ++i) ssgi_inv_vp[i] = inv[i] * invdet;
+        }
+
+        pass_set_mat4(&g_ssgi_pass, "uInvViewProj", (mat4){0});
+        GLint loc = glGetUniformLocation(g_ssgi_pass.prog, "uInvViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, ssgi_inv_vp);
+        loc = glGetUniformLocation(g_ssgi_pass.prog, "uViewProj");
+        glUniformMatrix4fv(loc, 1, GL_FALSE, ssgi_vp.m);
+
+        pass_set_vec3(&g_ssgi_pass, "uCamPos", cam);
+        vec2 res = { (float)g_scene_fb.width, (float)g_scene_fb.height };
+        pass_set_vec2(&g_ssgi_pass, "uResolution", res);
+
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+    }
 
     /* Blit G-buffer attachment 0 (lit scene) -> g_scene_fb.color, so the
        downstream chain (SSR, fog, TAA, bloom, tonemap) is unchanged. */
