@@ -18,6 +18,7 @@ typedef struct {
     float roughness_factor;
     float normal_scale;
     float occlusion_strength;
+    vec3  emissive_factor;
     float emissive_strength;
 
     int has_basecolor;

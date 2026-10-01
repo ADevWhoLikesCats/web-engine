@@ -28,6 +28,7 @@ static Material default_material(void) {
     m.normal_scale     = 1.0f;
     m.occlusion_strength = 1.0f;
     m.emissive_strength = 1.0f;
+    m.emissive_factor   = v3(0.0f, 0.0f, 0.0f);
     return m;
 }
 
@@ -73,8 +74,29 @@ static Material material_from_gltf(cgltf_material* gm) {
     GLuint nm = load_texture_from_gltf(&gm->normal_texture, 0);
     if (nm) { m.tex_normal = nm; m.has_normal = 1; m.normal_scale = gm->normal_texture.scale; }
 
+    /* Emissive factor — RGB multiplier for emissive texture, or the
+       standalone emissive color if no texture is present. */
+    m.emissive_factor = v3(gm->emissive_factor[0],
+                           gm->emissive_factor[1],
+                           gm->emissive_factor[2]);
+
+    /* KHR_materials_emissive_strength — enables HDR emissive (>1.0).
+       Headlights in glTF files typically use emissive_factor 1.0 with
+       emissive_strength 5.0 or higher to get a bright glow. */
+    if (gm->has_emissive_strength) {
+        m.emissive_strength = gm->emissive_strength.emissive_strength;
+    }
+
+    /* Load the emissive texture if there is one. */
     GLuint em = load_texture_from_gltf(&gm->emissive_texture, 1);
     if (em) { m.tex_emissive = em; m.has_emissive = 1; }
+
+    /* Mark as emissive if either the texture exists OR the factor is
+       nonzero (or the strength was explicitly set above). */
+    if (m.emissive_factor.x > 0.0f || m.emissive_factor.y > 0.0f ||
+        m.emissive_factor.z > 0.0f || m.emissive_strength > 1.0f) {
+        m.has_emissive = 1;
+    }
 
     GLuint oc = load_texture_from_gltf(&gm->occlusion_texture, 0);
     if (oc) { m.tex_occlusion = oc; m.has_occlusion = 1; }

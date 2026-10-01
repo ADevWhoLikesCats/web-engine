@@ -42,6 +42,7 @@ uniform float uMetallicFactor;
 uniform float uRoughnessFactor;
 uniform float uNormalScale;
 uniform int   uHasEmissive;
+uniform vec3  uEmissiveFactor;
 uniform float uEmissiveStrength;
 
 uniform int uHasBasecolor;
@@ -187,7 +188,10 @@ void main() {
        emissive attachment always has the right value. */
     vec3 emissive_radiance = vec3(0.0);
     if (uHasEmissive == 1) {
-        emissive_radiance = texture(uTexEmissive, vUV).rgb * uEmissiveStrength;
+        /* Sample the emissive texture (which may be a 1x1 solid-color
+           placeholder when no texture exists), multiply by the factor
+           from glTF, then by the strength from KHR_materials_emissive_strength. */
+        emissive_radiance = texture(uTexEmissive, vUV).rgb * uEmissiveFactor * uEmissiveStrength;
     }
 
     /* --- Normal (with normal map) --- */
