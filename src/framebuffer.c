@@ -137,3 +137,74 @@ Framebuffer fb_create_with_depth_tex(int width, int height, FBFormat fmt) {
     glBindTexture(GL_TEXTURE_2D, 0);
     return fb;
 }
+
+
+/* ------------------------------------------------------------------ */
+/* Multi-render-target G-buffer                                        */
+/*   attachment 0: lit scene        (RGBA16F)                          */
+/*   attachment 1: albedo           (RGBA16F)                          */
+/*   attachment 2: normal+roughness (RGBA16F)                          */
+/*   attachment 3: emissive         (RGBA16F)                          */
+/* Depth: borrowed from caller if depth_tex != 0.                     */
+/* ------------------------------------------------------------------ */
+Framebuffer fb_create_gbuffer(int width, int height, GLuint depth_tex) {
+    check_float_support();
+    Framebuffer fb = {0};
+    fb.width  = width;
+    fb.height = height;
+    fb.format = FB_RGBA16F;
+    fb.attachment_count = 4;
+
+    GLuint tex[4] = {0, 0, 0, 0};
+    glGenTextures(4, tex);
+    for (int i = 0; i < 4; ++i) {
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0,
+                     GL_RGBA, GL_HALF_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+
+    fb.color  = tex[0];
+    fb.color1 = tex[1];
+    fb.color2 = tex[2];
+    fb.color3 = tex[3];
+
+    glGenFramebuffers(1, &fb.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[0], 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, tex[1], 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, tex[2], 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_TEXTURE_2D, tex[3], 0);
+
+    if (depth_tex) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                               GL_TEXTURE_2D, depth_tex, 0);
+        fb.depth = 0;   /* do not own */
+    } else {
+        glGenRenderbuffers(1, &fb.depth);
+        glBindRenderbuffer(GL_RENDERBUFFER, fb.depth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                  GL_RENDERBUFFER, fb.depth);
+    }
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "[gbuffer] incomplete framebuffer (0x%04X) %dx%d\n",
+                status, width, height);
+        abort();
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    printf("[gbuffer] created %dx%d att0=%u att1=%u att2=%u att3=%u depth=%s\n",
+           width, height, tex[0], tex[1], tex[2], tex[3],
+           depth_tex ? "borrowed" : "owned");
+    return fb;
+}
