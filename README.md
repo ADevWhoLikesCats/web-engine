@@ -6,6 +6,10 @@ A hand-written 3D graphics engine that runs in a web browser. Written in C, comp
 
 The current demo renders a Lamborghini Revuelto on a reflective ground plane with full global illumination, real-time reflections, temporal anti-aliasing, bloom, depth of field, and shadows — all running at interactive framerates on integrated GPUs.
 
+
+![Demo Image](demo.png)
+
+
 ## Features
 
 **Rendering**
